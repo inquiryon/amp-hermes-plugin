@@ -137,12 +137,19 @@ class SessionStore:
         serializable = {key: asdict(value) for key, value in data.items()}
         text = json.dumps(serializable, indent=2) + "\n"
         tmp_path = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
-        tmp_path.write_text(text)
         try:
-            os.chmod(tmp_path, 0o600)
-        except OSError:
-            pass  # e.g. NTFS under WSL ignores POSIX modes; the key digest is the real protection
-        os.replace(tmp_path, self._path)
+            tmp_path.write_text(text)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass  # e.g. NTFS under WSL ignores POSIX modes; the key digest is the real protection
+            os.replace(tmp_path, self._path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
 
     def _load_clean(self) -> Dict[str, SessionRecord]:
         data, dirty = self._load_all()

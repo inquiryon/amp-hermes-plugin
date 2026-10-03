@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import hitl_poll
 from .amp_client import AmpClient, AmpClientError, request_deadline
@@ -55,9 +55,11 @@ _EXIT_FINALIZE_BUDGET_SECONDS = 3.0
 
 
 def _http_client_error_code(exc: BaseException) -> Optional[int]:
-    """HTTP status when AMP answered with a 4xx, else None (network error, 5xx, timeout)."""
+    """HTTP status when AMP answered but refused (4xx) or sent an unusable body (2xx/3xx
+    non-JSON); None for outages (network error, timeout, 5xx). A refusal is a decision,
+    so AMP_FAIL_CLOSED=false never turns it into an allow."""
     code = getattr(exc, "status_code", None)
-    if isinstance(code, int) and 400 <= code < 500:
+    if isinstance(code, int) and code < 500:
         return code
     return None
 
@@ -439,8 +441,9 @@ class AmpGovernancePlugin:
     ) -> str:
         fingerprint = self._config_fingerprint()
         record = self._store.get(session_id)
-        with self._open_sessions_lock:
-            self._open_sessions.add(session_id)
+        if session_id:
+            with self._open_sessions_lock:
+                self._open_sessions.add(session_id)
         if record and record.agent_fingerprint == fingerprint:
             return record.instance_id
         reconnected = record is not None
@@ -639,6 +642,8 @@ class AmpGovernancePlugin:
             )
             return "allow", ""
 
+        if not isinstance(response, dict):
+            response = {}  # falls through to the unexpected-status block below
         status = str(response.get("status") or "").strip().lower()
         reason = str(response.get("reason") or response.get("information") or "").strip()
         exec_ctx.last_policy_result = status
@@ -685,36 +690,32 @@ class AmpGovernancePlugin:
                 level="WARN",
             )
             self._announce_wait("the next LLM call", workitem_id)
-            outcome = poll_for_decision(
-                lambda: self._client.get_hitl_decision(instance_id),
-                instance_id=instance_id,
-                ledger=self._ledger,
-                deadline=time.time() + (self._config.hitl_timeout_minutes * 60),
-                interval_seconds=self._config.hitl_poll_interval_seconds,
-                bound_workitem_id=workitem_id,
-                label="LLM ",
-            )
-            self._ledger.mark_spent(instance_id, outcome.workitem_id)
-            self._safe_set_state(instance_id, "active")
+            # LLM middleware is not a Hermes hook or tool, so only the AMP timeout applies.
+            review_deadline = time.time() + (self._config.hitl_timeout_minutes * 60)
+            with request_deadline(review_deadline):
+                outcome = poll_for_decision(
+                    lambda: self._client.get_hitl_decision(instance_id),
+                    instance_id=instance_id,
+                    ledger=self._ledger,
+                    deadline=review_deadline,
+                    interval_seconds=self._config.hitl_poll_interval_seconds,
+                    bound_workitem_id=workitem_id,
+                    label="LLM ",
+                )
+                self._ledger.mark_spent(instance_id, outcome.workitem_id)
+                self._safe_set_state(instance_id, "active")
             return self._llm_outcome(exec_ctx, instance_id, api_call_count, outcome)
 
-        # Unexpected status
-        if self._config.llm_governance_fail_closed:
-            exec_ctx.llm_blocked += 1
-            exec_ctx.status = "blocked"
-            self._safe_log(
-                instance_id,
-                f"LLM unexpected AMP status '{status}'; fail-closed → block",
-                level="WARN",
-            )
-            return "block", f'AMP returned unexpected status "{status or "unknown"}"; LLM call blocked (fail-closed).'
-        exec_ctx.status = "running"
+        # Unexpected status (e.g. a reserved "deny"): AMP answered, so this is not an
+        # outage and AMP_LLM_GOVERNANCE_FAIL_CLOSED=false does not apply.
+        exec_ctx.llm_blocked += 1
+        exec_ctx.status = "blocked"
         self._safe_log(
             instance_id,
-            f"LLM unexpected AMP status '{status}'; fail-open → allow",
+            f"LLM unexpected AMP status '{status}'; blocked",
             level="WARN",
         )
-        return "allow", ""
+        return "block", f'AMP returned unexpected status "{status or "unknown"}"; LLM call blocked.'
 
     def _llm_outcome(
         self,
@@ -898,7 +899,9 @@ class AmpGovernancePlugin:
             return None
 
         if not isinstance(response, dict):
-            response = {}
+            message = f"AMP returned an unreadable governance response for {action.raw_tool_name}; blocked."
+            self._safe_log(instance_id, message, level="ERROR")
+            return self._block_message(message)
         status = str(response.get("status") or "").strip().lower()
         reason = str(response.get("reason") or response.get("information") or "").strip()
         self._safe_log(
@@ -931,11 +934,11 @@ class AmpGovernancePlugin:
                 action_id=action_id, call_fingerprint=call_fingerprint,
             )
 
-        if self._config.fail_closed:
-            return self._block_message(
-                f'AMP returned unexpected status "{status or "unknown"}" for {action.raw_tool_name}; blocked.'
-            )
-        return None
+        # AMP answered with something that is not an allow (e.g. a reserved "deny" or an
+        # unknown status). That is not an outage, so AMP_FAIL_CLOSED=false does not apply.
+        return self._block_message(
+            f'AMP returned unexpected status "{status or "unknown"}" for {action.raw_tool_name}; blocked.'
+        )
 
     def _await_tool_review(
         self,
@@ -974,12 +977,10 @@ class AmpGovernancePlugin:
             watchdog_seconds=watchdog,
         )
         bound = outcome.workitem_id
-        if outcome.kind in hitl_poll.TERMINAL_KINDS:
-            self._ledger.mark_spent(instance_id, bound)
-        else:
-            # Gave up while the review is still open: never let a later call consume
-            # its decision, but let an identical retry wait on it (A19).
-            self._ledger.mark_spent(instance_id, bound)
+        # Consumed or abandoned: no later call may act on this workitem's decision ...
+        self._ledger.mark_spent(instance_id, bound)
+        if outcome.kind not in hitl_poll.TERMINAL_KINDS:
+            # ... except an identical retry, which waits on the still-open review (A19).
             self._ledger.remember_pending(instance_id, call_fingerprint, bound, action_id)
         if outcome.kind != hitl_poll.TIMED_OUT:
             self._safe_log(
@@ -1368,7 +1369,7 @@ class AmpGovernancePlugin:
         if open_sessions:
             self._finalize_within_budget(open_sessions, reason="process_exit")
 
-    def _finalize_within_budget(self, session_ids: list, *, reason: str) -> None:
+    def _finalize_within_budget(self, session_ids: List[str], *, reason: str) -> None:
         deadline = time.time() + _EXIT_FINALIZE_BUDGET_SECONDS
         with request_deadline(deadline, hard=True):
             for session_id in session_ids:
@@ -1483,6 +1484,15 @@ class AmpGovernancePlugin:
             return decision
         except Exception as exc:
             logger.warning("amp-governance pre_tool_call failed: %s", exc)
+            refused_code = _http_client_error_code(exc)
+            if refused_code is not None:
+                # e.g. init_instance with a revoked key: a refusal, never fail-open.
+                message = (
+                    f'AMP rejected the governance request for "{tool_name}" (HTTP {refused_code}); blocked. '
+                    f"{_truncate(getattr(exc, 'body', '') or str(exc), 200)}"
+                ).strip()
+                self._record_blocked_turn(session_id, message)
+                return self._block_message(message)
             if self._config.fail_closed or time.time() >= budget.deadline:
                 message = (
                     f'AMP governance failed while checking "{tool_name}": {exc}'

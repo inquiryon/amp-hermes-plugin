@@ -404,7 +404,8 @@ class PolicyOutcomeTests(unittest.TestCase):
 
         next_call.assert_not_called()
 
-    def test_unexpected_amp_status_fail_open_allows(self):
+    def test_unexpected_amp_status_blocks_even_when_fail_open(self):
+        # An unknown status (e.g. a reserved "deny") is an AMP answer, not an outage.
         plugin = _make_plugin(fail_closed=False)
         exec_ctx = _make_exec_ctx()
         plugin._exec_contexts._store["sess-1"] = exec_ctx
@@ -413,15 +414,14 @@ class PolicyOutcomeTests(unittest.TestCase):
         plugin._notify_user = Mock()
         next_call = _make_next_call("resp")
 
-        with patch.object(plugin, "_safe_log"):
-            result = plugin.llm_execution_middleware(
+        with patch.object(plugin, "_safe_log"), self.assertRaises(self.LEB):
+            plugin.llm_execution_middleware(
                 request={"messages": []}, next_call=next_call,
                 session_id="sess-1", model="m", provider="p", base_url="",
                 api_call_count=1,
             )
 
-        self.assertEqual(result, "resp")
-        next_call.assert_called_once()
+        next_call.assert_not_called()
 
     def test_unexpected_amp_status_fail_closed_blocks(self):
         plugin = _make_plugin(fail_closed=True)

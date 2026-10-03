@@ -91,8 +91,18 @@ class AmpClient:
         timeout = _http_timeout()
         try:
             with urlopen(req, timeout=timeout) as resp:
-                body = resp.read().decode("utf-8") or "{}"
+                body = resp.read().decode("utf-8", errors="replace") or "{}"
+                status = getattr(resp, "status", None)
+            try:
                 return json.loads(body)
+            except ValueError as exc:
+                # AMP (or a proxy/captive portal in front of it) answered with something
+                # that is not JSON. Carry the status so callers treat it as an answer.
+                raise AmpClientError(
+                    f"AMP returned a non-JSON response (HTTP {status})",
+                    status_code=status if isinstance(status, int) else 200,
+                    body=body[:500],
+                ) from exc
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
             raise AmpClientError(

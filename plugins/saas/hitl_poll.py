@@ -8,7 +8,9 @@ scoped to the AMP *instance*, not the call — it returns the newest workitem of
 the instance. A call therefore binds to the first ``workitem_id`` it sees (the
 request response, else its first pending poll) and only accepts a ``complete``
 decision for that workitem. Before a workitem is bound, decisions for
-workitems this process already consumed or abandoned are ignored.
+workitems this process already consumed or abandoned, or that another live
+call has claimed, are ignored. An approval without a workitem_id is only
+accepted when action_id correlation proves it belongs to this call.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import logging
 import threading
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
+import uuid
 
 from .amp_client import AmpClientError
 
@@ -80,6 +83,8 @@ class DecisionLedger:
     * spent: workitems whose decision was consumed, or whose call gave up
       waiting. A later call must never act on their decision unless it is
       explicitly re-bound to them (A19 reuse).
+    * claimed: workitems a live poll is bound to (owner token). Other polls on
+      the same instance never bind to or consume them.
     * pending reviews: workitems still awaiting a reviewer when the call gave
       up, keyed by the call's (tool, action, args) fingerprint, so an identical
       retry waits on the same review instead of opening a new one (A19).
@@ -89,6 +94,7 @@ class DecisionLedger:
         self._lock = threading.Lock()
         self._spent: Dict[str, "OrderedDict[str, None]"] = {}
         self._pending: Dict[str, "OrderedDict[str, Tuple[str, Optional[str]]]"] = {}
+        self._claims: Dict[str, Dict[str, str]] = {}
 
     @staticmethod
     def _bounded_put(store: "OrderedDict[str, Any]", key: str, value: Any) -> None:
@@ -106,6 +112,56 @@ class DecisionLedger:
     def is_spent(self, instance_id: str, workitem_id: str) -> bool:
         with self._lock:
             return workitem_id in self._spent.get(instance_id, ())
+
+    def claim(self, instance_id: str, workitem_id: str, owner: str, *, force: bool = False) -> bool:
+        """Bind ``workitem_id`` to one live poll. False if it is spent or another poll holds it.
+
+        ``force`` is for a workitem AMP returned for this very request (or an A19 reuse):
+        that binding is authoritative, so it takes the claim and clears "spent".
+        """
+        if not workitem_id:
+            return False
+        with self._lock:
+            claims = self._claims.setdefault(instance_id, {})
+            if force:
+                self._spent.get(instance_id, OrderedDict()).pop(workitem_id, None)
+                claims[workitem_id] = owner
+                return True
+            if workitem_id in self._spent.get(instance_id, ()):
+                return False
+            holder = claims.get(workitem_id)
+            if holder is not None and holder != owner:
+                return False
+            claims[workitem_id] = owner
+            return True
+
+    def usable_by(self, instance_id: str, workitem_id: str, owner: str) -> bool:
+        """True when ``owner`` may act on ``workitem_id`` (not spent, not claimed by another poll)."""
+        with self._lock:
+            if workitem_id in self._spent.get(instance_id, ()):
+                return False
+            holder = self._claims.get(instance_id, {}).get(workitem_id)
+            return holder is None or holder == owner
+
+    def try_consume(self, instance_id: str, workitem_id: str, owner: str) -> bool:
+        """Atomically check-and-mark a decision as consumed by ``owner``."""
+        with self._lock:
+            if workitem_id in self._spent.get(instance_id, ()):
+                return False
+            claims = self._claims.get(instance_id, {})
+            holder = claims.get(workitem_id)
+            if holder is not None and holder != owner:
+                return False
+            claims.pop(workitem_id, None)
+            self._bounded_put(self._spent.setdefault(instance_id, OrderedDict()), workitem_id, None)
+            return True
+
+    def release(self, instance_id: str, owner: str) -> None:
+        """Drop every claim ``owner`` still holds (the poll ended)."""
+        with self._lock:
+            claims = self._claims.get(instance_id, {})
+            for workitem_id in [w for w, holder in claims.items() if holder == owner]:
+                del claims[workitem_id]
 
     def remember_pending(
         self, instance_id: str, fingerprint: str, workitem_id: str, action_id: Optional[str]
@@ -127,6 +183,7 @@ class DecisionLedger:
         with self._lock:
             self._spent.pop(instance_id, None)
             self._pending.pop(instance_id, None)
+            self._claims.pop(instance_id, None)
 
 
 def poll_for_decision(
@@ -144,10 +201,34 @@ def poll_for_decision(
 ) -> PollOutcome:
     """Poll until a decision for this call arrives or ``deadline`` passes.
 
-    ``budget_limited`` selects BUDGET_EXHAUSTED over TIMED_OUT when the deadline
-    passes (a Hermes limit, not the AMP timeout, was binding).
+    ``bound_workitem_id`` is the workitem AMP returned for this call's request
+    (authoritative). ``budget_limited`` selects BUDGET_EXHAUSTED over TIMED_OUT
+    when the deadline passes (a Hermes limit, not the AMP timeout, was binding).
     """
+    owner = uuid.uuid4().hex
     bound = str(bound_workitem_id or "").strip()
+    if bound:
+        ledger.claim(instance_id, bound, owner, force=True)
+    try:
+        return _poll(fetch, instance_id, ledger, owner, bound, deadline, interval_seconds,
+                     budget_limited, action_id, watchdog_seconds, label)
+    finally:
+        ledger.release(instance_id, owner)
+
+
+def _poll(
+    fetch: Callable[[], Dict[str, Any]],
+    instance_id: str,
+    ledger: DecisionLedger,
+    owner: str,
+    bound: str,
+    deadline: float,
+    interval_seconds: float,
+    budget_limited: bool,
+    action_id: Optional[str],
+    watchdog_seconds: Optional[float],
+    label: str,
+) -> PollOutcome:
     started = time.time()
     polls = 0
     while True:
@@ -178,18 +259,22 @@ def poll_for_decision(
         status = _lower(decision.get("status"))
         workitem_id = str(decision.get("workitem_id") or "").strip()
         if workitem_id and workitem_id != bound:
-            if bound or ledger.is_spent(instance_id, workitem_id):
+            if bound or not ledger.usable_by(instance_id, workitem_id, owner):
                 continue  # another call's workitem (H3): never act on it
 
         if status == "complete":
-            if bound and not workitem_id:
-                continue  # cannot prove the decision is ours
-            ledger.mark_spent(instance_id, workitem_id)
+            resolution = _lower(decision.get("resolution"))
+            if not workitem_id:
+                # Cannot prove the decision is ours. Only a correlated (action_id-echoed)
+                # or tighten-only decision may be taken without a workitem id.
+                if bound or (resolution in _APPROVE | _MODIFY and action_id is None):
+                    continue
+            elif not ledger.try_consume(instance_id, workitem_id, owner):
+                continue  # consumed by another poll in the meantime
             information = str(decision.get("information") or "").strip()
             cancelled = _lower(decision.get("method")) == "cancelled" or _lower(
                 decision.get("workitem_status")
             ) in _CANCELLED
-            resolution = _lower(decision.get("resolution"))
             if cancelled:
                 kind = CANCELLED
             elif resolution in _APPROVE:
@@ -206,7 +291,7 @@ def poll_for_decision(
             return PollOutcome(CANCELLED, workitem_id or bound, information=information, polls=polls)
 
         # pending (or an unrecognised status): keep waiting on this call's workitem
-        if not bound and workitem_id:
+        if not bound and workitem_id and ledger.claim(instance_id, workitem_id, owner):
             bound = workitem_id
         if (
             action_id is not None

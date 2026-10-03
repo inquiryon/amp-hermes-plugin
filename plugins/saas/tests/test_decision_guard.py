@@ -220,5 +220,103 @@ class InstanceStateTests(unittest.TestCase):
         self.assertIsNone(_governed(plugin))
 
 
+class ReviewFindingTests(unittest.TestCase):
+    """Gate-2 review findings: paths that could allow without this call's approval."""
+
+    def _poll(self, ledger, decisions, *, bound="", action_id=None, minutes=1):
+        from hermes.hitl_poll import poll_for_decision
+
+        fetch = Mock(side_effect=list(decisions)) if isinstance(decisions, list) else Mock(return_value=decisions)
+        clock = FakeClock()
+        with clock.installed():
+            return poll_for_decision(
+                fetch, instance_id="inst-1", ledger=ledger, deadline=clock.now + minutes * 60,
+                interval_seconds=1, bound_workitem_id=bound, action_id=action_id,
+            )
+
+    def test_unbound_call_never_takes_a_workitem_claimed_by_another_live_call(self) -> None:
+        from hermes.hitl_poll import APPROVED, DecisionLedger
+
+        ledger = DecisionLedger()
+        self.assertTrue(ledger.claim("inst-1", "W1", "call-A"))
+        outcome = self._poll(ledger, complete("approve", "W1"))
+        self.assertNotEqual(outcome.kind, APPROVED)
+
+    def test_unbound_call_does_not_bind_to_pending_workitem_claimed_by_another_call(self) -> None:
+        from hermes.hitl_poll import APPROVED, DecisionLedger
+
+        ledger = DecisionLedger()
+        ledger.claim("inst-1", "W1", "call-A")
+        outcome = self._poll(ledger, [pending("W1"), complete("approve", "W1")])
+        self.assertNotEqual(outcome.kind, APPROVED)
+
+    def test_unbound_approval_without_workitem_id_is_not_accepted(self) -> None:
+        from hermes.hitl_poll import APPROVED, DecisionLedger
+
+        outcome = self._poll(DecisionLedger(), {"status": "complete", "resolution": "approve"})
+        self.assertNotEqual(outcome.kind, APPROVED)
+
+    def test_unbound_reject_without_workitem_id_still_blocks_at_once(self) -> None:
+        from hermes.hitl_poll import REJECTED, DecisionLedger
+
+        outcome = self._poll(DecisionLedger(), {"status": "complete", "resolution": "reject", "method": "fallback"})
+        self.assertEqual(outcome.kind, REJECTED)
+        self.assertEqual(outcome.polls, 1)
+
+    def test_init_4xx_blocks_even_when_fail_open(self) -> None:
+        from hermes.amp_client import AmpClientError
+
+        plugin = make_plugin(fail_closed=False)
+        clock = FakeClock()
+        with patch.object(plugin, "_safe_log"), clock.installed(), patch.object(
+            plugin, "_ensure_instance", side_effect=AmpClientError("HTTP 401", status_code=401, body="bad key")
+        ):
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertIn("HTTP 401", result["message"])
+
+    def test_non_dict_response_blocks_even_when_fail_open(self) -> None:
+        plugin = make_plugin(fail_closed=False)
+        plugin._client.request_hitl = Mock(return_value=["not", "a", "dict"])
+        result = _governed(plugin)
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+
+    def test_unknown_or_deny_status_blocks_even_when_fail_open(self) -> None:
+        for status in ("deny", "rejected", "banana", ""):
+            with self.subTest(status=status):
+                plugin = make_plugin(fail_closed=False)
+                plugin._client.request_hitl = Mock(return_value={"status": status})
+                result = _governed(plugin)
+                assert result is not None
+                self.assertEqual(result["action"], "block")
+
+    def test_non_json_200_blocks_even_when_fail_open(self) -> None:
+        from types import SimpleNamespace
+        from hermes.amp_client import AmpClient
+
+        class _Html:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b"<html>captive portal</html>"
+
+        plugin = make_plugin(fail_closed=False)
+        plugin._client = AmpClient(SimpleNamespace(
+            backend_url="http://amp.invalid", api_key="k", org_id="o", agent_name="a", username="u",
+        ))
+        with patch("hermes.amp_client.urlopen", return_value=_Html()):
+            result = _governed(plugin)
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+
+
 if __name__ == "__main__":
     unittest.main()
