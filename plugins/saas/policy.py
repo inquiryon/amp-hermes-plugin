@@ -31,21 +31,38 @@ _REDACTION_INPUT_LIMIT = 8192
 # The plugin's own tools; everything else is governed when AMP_GOVERN_UNLISTED_TOOLS is on.
 OWN_TOOLS = frozenset({"amp_evaluate_research_plan", "amp_load_research_topics", "amp_governance_summary"})
 
-# Argument names whose values are never sent: a secret word as a whole name component
-# (api_key, X-Auth-Token, db_password), not as a substring (keyword, author).
-_SECRET_KEY_RE = re.compile(
-    r"(?i)(?:^|[_\-.\s])(?:api[_-]?key|key|token|secret|passw(?:or)?d|pass|pwd|credentials?"
-    r"|auth(?:orization)?|cookie|private[_-]?key|access[_-]?key)(?:$|[_\-.\s])"
-)
+# A name is secret when its LAST component is a secret word (db_password, clientSecret,
+# X-Auth-Token, api_key), so names that merely contain one (bypass_hook, tokenizer_cmd,
+# secret_note, auth_mode, passenger) stay visible: redaction must not hide payloads.
+_SECRET_SUFFIXES = frozenset({
+    "password", "passwd", "pwd", "pass", "secret", "token", "key", "apikey", "credential",
+    "credentials", "cookie", "authorization", "privatekey",
+})
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NAME_SPLIT_RE = re.compile(r"[_\-.\s]+")
 
-_SECRET_WORD = r"(?:pass(?:word|wd)?|pwd|secret|token|api[_-]?key|access[_-]?key|credential)"
+
+def is_secret_name(name: Any) -> bool:
+    parts = [p for p in _NAME_SPLIT_RE.split(_CAMEL_BOUNDARY_RE.sub("_", str(name)).lower()) if p]
+    return bool(parts) and parts[-1] in _SECRET_SUFFIXES
+
+
+def _redact_named_value(match: "re.Match[str]") -> str:
+    name, separator, value = match.group(1), match.group(2), match.group(3)
+    if is_secret_name(name.strip('"')) and value.strip("'\"") and not any(c.isspace() for c in value):
+        quote = value[0] if value[:1] in {"'", '"'} else ""
+        return f"{name}{separator}{quote}{_REDACTED}{quote}"
+    return match.group(0)
+
 
 # Fallback value patterns, applied after Hermes's own redactor (agent.redact) when present.
 # All quantifiers are bounded so adversarial input cannot make them super-linear.
 _SECRET_VALUE_PATTERNS = (
-    # Only a real PEM block (base64 body + END marker); text after a bare BEGIN stays visible.
+    # Only a real PEM block (base64 body + END marker; JSON-escaped \n allowed); text
+    # after a bare BEGIN stays visible.
     re.compile(
-        r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[A-Za-z0-9+/=\s]{1,16384}?-----END [A-Z ]{0,40}PRIVATE KEY-----"
+        r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----(?:[A-Za-z0-9+/=\s]|\\[nr]){1,16384}?"
+        r"-----END [A-Z ]{0,40}PRIVATE KEY-----"
     ),
     re.compile(r"\bamp_k_[A-Za-z0-9_\-]{8,200}"),
     re.compile(r"\bsk-[A-Za-z0-9_\-]{16,200}"),
@@ -54,12 +71,12 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,2000}\.[A-Za-z0-9_\-]{10,2000}\.[A-Za-z0-9_\-]{10,2000}"),
-    # JSON: "db_password": "x", "client_secret": "y"
-    re.compile(r'(?i)("[^"\n]{0,40}' + _SECRET_WORD + r'[^"\n]{0,40}")(\s{0,5}:\s{0,5})"[^"\n]{0,4096}"'),
-    # Assignments: password=x, API_KEY: "y"
-    re.compile(
-        r"(?i)\b([A-Za-z0-9_]{0,40}" + _SECRET_WORD + r"[A-Za-z0-9_]{0,40})(\s{0,5}[:=]\s{0,5})(['\"]?)[^\s'\"]{1,4096}\3"
-    ),
+)
+# name/value pairs: JSON ("db_password": "x") and assignments (API_KEY=x, token: "y").
+# Redacted only when the name is secret (is_secret_name) and the value is one token.
+_NAMED_VALUE_PATTERNS = (
+    re.compile(r'("[A-Za-z0-9_\-.]{1,80}")(\s{0,5}:\s{0,5})("[^"\n]{0,4096}")'),
+    re.compile(r"\b([A-Za-z0-9_\-.]{1,80})(\s{0,5}[:=]\s{0,5})((['\"])[^'\"\n]{1,4096}\4|[^\s'\",}]{1,4096})"),
 )
 
 
@@ -78,13 +95,13 @@ def redact_secrets_counted(text: str) -> Tuple[str, int]:
     except Exception:
         pass
     for pattern in _SECRET_VALUE_PATTERNS:
-        if pattern.groups >= 3:
-            redacted, n = pattern.subn(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", redacted)
-        elif pattern.groups == 2:
-            redacted, n = pattern.subn(lambda m: f'{m.group(1)}{m.group(2)}"{_REDACTED}"', redacted)
-        else:
-            redacted, n = pattern.subn(_REDACTED, redacted)
+        redacted, n = pattern.subn(_REDACTED, redacted)
         count += n
+    for pattern in _NAMED_VALUE_PATTERNS:
+        before = redacted
+        redacted = pattern.sub(_redact_named_value, redacted)
+        if redacted != before:
+            count += max(redacted.count(_REDACTED) - before.count(_REDACTED), 1)
     return redacted, count
 
 
@@ -127,24 +144,34 @@ def _patch_content(args: Dict[str, Any]) -> str:
     return f"--- old_string\n{old}\n+++ new_string\n{new}"
 
 
-def _drop_secret_keys(value: Any) -> Any:
+def _drop_secret_keys(value: Any, counter: list) -> Any:
     if isinstance(value, dict):
-        return {
-            key: (_REDACTED if _SECRET_KEY_RE.search(str(key)) else _drop_secret_keys(item))
-            for key, item in value.items()
-        }
+        out = {}
+        for key, item in value.items():
+            if is_secret_name(key):
+                counter.append(key)
+                out[key] = _REDACTED
+            else:
+                out[key] = _drop_secret_keys(item, counter)
+        return out
     if isinstance(value, list):
-        return [_drop_secret_keys(item) for item in value]
+        return [_drop_secret_keys(item, counter) for item in value]
     return value
 
 
 def unlisted_tool_context(args: Dict[str, Any]) -> Dict[str, Any]:
-    text = json.dumps(_drop_secret_keys(args), sort_keys=True, default=str)
-    preview = redact_secrets_counted(text[:_REDACTION_INPUT_LIMIT])[0]
+    dropped: list = []
+    text = json.dumps(_drop_secret_keys(args, dropped), sort_keys=True, default=str)
+    preview, redactions = redact_secrets_counted(text[:_REDACTION_INPUT_LIMIT])
     truncated = len(preview) > UNLISTED_ARGS_LIMIT_CHARS or len(text) > _REDACTION_INPUT_LIMIT
     if truncated:
         preview = preview[:UNLISTED_ARGS_LIMIT_CHARS] + _TRUNCATION_MARKER
-    return {"arguments": preview, "arguments_truncated": truncated}
+    return {
+        "arguments": preview,
+        "arguments_truncated": truncated,
+        # Tells the reviewer how many values were masked (they can't see those).
+        "arguments_redactions": len(dropped) + redactions,
+    }
 
 
 def normalize_tool_call(
