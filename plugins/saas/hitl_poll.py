@@ -11,6 +11,14 @@ decision for that workitem. Before a workitem is bound, decisions for
 workitems this process already consumed or abandoned, or that another live
 call has claimed, are ignored. An approval without a workitem_id is only
 accepted when action_id correlation proves it belongs to this call.
+
+Contract K2.1 (action_id correlation off): AMP's get-decision returns the
+instance's newest workitem (ORDER BY created DESC LIMIT 1, any status). The
+caller holds a per-instance lock, polls once *before* its request, and passes
+that workitem as ``foreign``: it existed before this call, so it is never
+bound or accepted. ``accept_unbound=False`` (baseline unknown) means a
+decision is only accepted for a workitem bound via a pending poll or the
+request response.
 """
 
 from __future__ import annotations
@@ -20,7 +28,7 @@ from dataclasses import dataclass
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple
 import uuid
 
 from .amp_client import AmpClientError
@@ -198,6 +206,8 @@ def poll_for_decision(
     action_id: Optional[str] = None,
     watchdog_seconds: Optional[float] = None,
     label: str = "",
+    foreign_workitem_ids: FrozenSet[str] = frozenset(),
+    accept_unbound: bool = True,
 ) -> PollOutcome:
     """Poll until a decision for this call arrives or ``deadline`` passes.
 
@@ -211,7 +221,8 @@ def poll_for_decision(
         ledger.claim(instance_id, bound, owner, force=True)
     try:
         return _poll(fetch, instance_id, ledger, owner, bound, deadline, interval_seconds,
-                     budget_limited, action_id, watchdog_seconds, label)
+                     budget_limited, action_id, watchdog_seconds, label,
+                     frozenset(foreign_workitem_ids), accept_unbound)
     finally:
         ledger.release(instance_id, owner)
 
@@ -228,6 +239,8 @@ def _poll(
     action_id: Optional[str],
     watchdog_seconds: Optional[float],
     label: str,
+    foreign: FrozenSet[str],
+    accept_unbound: bool,
 ) -> PollOutcome:
     started = time.time()
     polls = 0
@@ -259,8 +272,8 @@ def _poll(
         status = _lower(decision.get("status"))
         workitem_id = str(decision.get("workitem_id") or "").strip()
         if workitem_id and workitem_id != bound:
-            if bound or not ledger.usable_by(instance_id, workitem_id, owner):
-                continue  # another call's workitem (H3): never act on it
+            if bound or workitem_id in foreign or not ledger.usable_by(instance_id, workitem_id, owner):
+                continue  # pre-existing or another call's workitem (H3/K2.1): never act on it
 
         if status == "complete":
             resolution = _lower(decision.get("resolution"))
@@ -269,6 +282,8 @@ def _poll(
                 # or tighten-only decision may be taken without a workitem id.
                 if bound or (resolution in _APPROVE | _MODIFY and action_id is None):
                     continue
+            elif workitem_id != bound and not accept_unbound:
+                continue  # baseline unknown: only a workitem seen pending (bound) is provably ours
             elif not ledger.try_consume(instance_id, workitem_id, owner):
                 continue  # consumed by another poll in the meantime
             information = str(decision.get("information") or "").strip()

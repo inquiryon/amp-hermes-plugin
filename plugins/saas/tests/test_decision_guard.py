@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from hermes.hitl_poll import REVIEWER_NOTE_LIMIT, reviewer_note
-from hitl_helpers import FakeClock, complete, make_plugin, pending, quiet
+from hitl_helpers import BASELINE, FakeClock, complete, make_plugin, pending, quiet
 
 
 def _governed(plugin, *, args=None, clock=None, tool="terminal"):
@@ -25,9 +25,10 @@ class StaleDecisionGuardTests(unittest.TestCase):
         # The request response carries no workitem_id (created asynchronously by AMP).
         plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
         plugin._client.get_hitl_decision = Mock(side_effect=[
-            pending("wi-1"), complete("approve", "wi-1"),           # call 1
-            complete("approve", "wi-1"),                            # call 2: stale
-            pending("wi-2"), complete("reject", "wi-2", "no"),      # call 2: its own review
+            BASELINE, pending("wi-1"), complete("approve", "wi-1"),  # call 1
+            complete("approve", "wi-1"),                             # call 2: baseline
+            complete("approve", "wi-1"),                             # call 2: stale
+            pending("wi-2"), complete("reject", "wi-2", "no"),       # call 2: its own review
         ])
         first = _governed(plugin, args={"command": "echo one"})
         second = _governed(plugin, args={"command": "echo two"})
@@ -35,12 +36,12 @@ class StaleDecisionGuardTests(unittest.TestCase):
         assert second is not None
         self.assertEqual(second["action"], "block")
         self.assertIn("rejected", second["message"])
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 5)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 7)
 
     def test_stale_approval_alone_never_allows(self) -> None:
         plugin = make_plugin(hitl_timeout_minutes=1)
         plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
-        plugin._client.get_hitl_decision = Mock(side_effect=[pending("wi-1"), complete("approve", "wi-1")])
+        plugin._client.get_hitl_decision = Mock(side_effect=[BASELINE, pending("wi-1"), complete("approve", "wi-1")])
         self.assertIsNone(_governed(plugin))
         plugin._client.get_hitl_decision = Mock(return_value=complete("approve", "wi-1"))
         result = _governed(plugin, args={"command": "rm -rf /"})
@@ -69,10 +70,10 @@ class StaleDecisionGuardTests(unittest.TestCase):
         plugin = make_plugin(hitl_timeout_minutes=1)
         plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
         plugin._client.get_hitl_decision = Mock(side_effect=[
-            pending("wi-5"), complete("approve", "wi-4"), complete("approve", "wi-5"),
+            BASELINE, pending("wi-5"), complete("approve", "wi-4"), complete("approve", "wi-5"),
         ])
         self.assertIsNone(_governed(plugin))
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 4)
 
     def test_abandoned_workitem_decision_is_not_consumed_by_next_call(self) -> None:
         plugin = make_plugin(hitl_timeout_minutes=1)
@@ -159,7 +160,7 @@ class MessageTests(unittest.TestCase):
             if polls is None:
                 plugin._client.get_hitl_decision = Mock(return_value=pending("wi-1"))
             else:
-                plugin._client.get_hitl_decision = Mock(side_effect=polls)
+                plugin._client.get_hitl_decision = Mock(side_effect=[BASELINE, *polls])
             messages[marker] = _governed(plugin)["message"]
             self.assertIn(marker, messages[marker])
         unavailable = make_plugin()

@@ -462,7 +462,8 @@ class LlmFailClosedTests(unittest.TestCase):
         else:
             plugin._client.request_llm_hitl = Mock(return_value=amp_response)
         if decisions is not None:
-            plugin._client.get_hitl_decision = Mock(side_effect=list(decisions))
+            # K2.1: one baseline get-decision precedes the request.
+            plugin._client.get_hitl_decision = Mock(side_effect=[{"status": "pending"}, *decisions])
         plugin._notify_user = Mock()
         with patch.object(plugin, "_safe_log"), patch("time.sleep", return_value=None):
             return plugin._evaluate_llm_governance(
@@ -504,7 +505,7 @@ class LlmFailClosedTests(unittest.TestCase):
         )
         self.assertEqual(decision, "block")
         self.assertIn("HTTP 403", reason)
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)  # baseline + 1 poll
 
     def test_request_4xx_blocks_llm_call_even_when_fail_open(self):
         from hermes.amp_client import AmpClientError
@@ -524,7 +525,7 @@ class LlmFailClosedTests(unittest.TestCase):
              {"status": "complete", "resolution": "reject", "workitem_id": "w-2"}],
         )
         self.assertEqual(decision, "block")
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)  # baseline + 2 polls
 
     def test_reviewer_note_is_labelled_on_reject(self):
         plugin = _make_plugin()

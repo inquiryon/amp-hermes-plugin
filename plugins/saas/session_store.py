@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 
@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 # Length of the API-key digest kept in a fingerprint. The fingerprint only has
 # to tell "same key" from "different key"; it must never hold the key itself.
 _KEY_DIGEST_CHARS = 16
+# Consumed/abandoned AMP workitems remembered per record, so a restarted process that
+# reuses the instance_id cannot act on an old decision (contract K2.1).
+SPENT_WORKITEMS_LIMIT = 50
 _KEY_DIGEST_RE = re.compile(r"^[0-9a-f]{%d}$" % _KEY_DIGEST_CHARS)
 
 
@@ -83,6 +86,8 @@ class SessionRecord:
     # never calls init_instance() again, so AMP never records a fresh
     # connection for the new agent. See agent_fingerprint().
     agent_fingerprint: str = ""
+    # Newest last, at most SPENT_WORKITEMS_LIMIT entries.
+    spent_workitem_ids: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> Optional["SessionRecord"]:
@@ -94,7 +99,10 @@ class SessionRecord:
         known = {key: value for key, value in payload.items() if key in _RECORD_FIELDS}
         if not known.get("session_id") or not known.get("instance_id"):
             return None
-        if not all(isinstance(value, str) for value in known.values()):
+        spent = known.get("spent_workitem_ids", [])
+        if not isinstance(spent, list) or not all(isinstance(item, str) for item in spent):
+            return None
+        if not all(isinstance(value, str) for key, value in known.items() if key != "spent_workitem_ids"):
             return None
         return cls(**known)
 
@@ -173,6 +181,30 @@ class SessionStore:
                 record.created_at = record.last_seen_at
             data[record.session_id] = record
             self._save_all(data)
+
+    def remember_spent(self, instance_id: str, workitem_id: str) -> None:
+        """Record a consumed/abandoned workitem on every record of ``instance_id`` (bounded)."""
+        if not instance_id or not workitem_id:
+            return
+        with self._lock:
+            data, dirty = self._load_all()
+            for record in data.values():
+                if record.instance_id != instance_id:
+                    continue
+                ids = [item for item in record.spent_workitem_ids if item != workitem_id]
+                ids.append(workitem_id)
+                record.spent_workitem_ids = ids[-SPENT_WORKITEMS_LIMIT:]
+                dirty = True
+            if dirty:
+                self._save_all(data)
+
+    def spent_for_instance(self, instance_id: str) -> List[str]:
+        with self._lock:
+            ids: List[str] = []
+            for record in self._load_clean().values():
+                if record.instance_id == instance_id:
+                    ids.extend(item for item in record.spent_workitem_ids if item not in ids)
+            return ids
 
     def delete(self, session_id: str) -> None:
         with self._lock:

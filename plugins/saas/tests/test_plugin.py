@@ -32,7 +32,7 @@ from hermes import (
 from hermes.amp_client import AmpClient, AmpClientError
 from hermes.policy import NormalizedAction
 from hermes.session_store import SessionStore
-from hitl_helpers import FakeClock, complete, make_plugin, pending, quiet, terminal_action
+from hitl_helpers import BASELINE, FakeClock, complete, make_plugin, pending, quiet, terminal_action
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +434,7 @@ class ToolGovernanceRegressionTests(unittest.TestCase):
     def test_pre_tool_call_allows_on_no_hitl(self) -> None:
         plugin = AmpGovernancePlugin()
         plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})  # K2.1 baseline
         plugin._config = SimpleNamespace(
             is_configured=True,
             fail_closed=True,
@@ -1069,7 +1070,7 @@ class HitlResolutionTests(unittest.TestCase):
     def _run(self, decisions, **config):
         plugin = make_plugin(**config)
         plugin._client.request_hitl = Mock(return_value=pending("w1"))
-        plugin._client.get_hitl_decision = Mock(side_effect=list(decisions))
+        plugin._client.get_hitl_decision = Mock(side_effect=[BASELINE, *decisions])
         clock = FakeClock()
         with quiet(plugin), clock.installed():
             result = plugin.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /x"}, session_id="s1")
@@ -1099,7 +1100,7 @@ class HitlResolutionTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result["action"], "block")
         self.assertIn("cancelled", result["message"])
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)  # baseline + 1 poll
 
     def test_cancelled_method_says_cancelled_not_rejected(self) -> None:
         # Contract K1 shape.
@@ -1121,7 +1122,7 @@ class HitlResolutionTests(unittest.TestCase):
     def test_plain_pending_keeps_polling(self) -> None:
         plugin, result = self._run([pending("w1"), pending("w1"), complete("approve", "w1")])
         self.assertIsNone(result)
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 4)  # baseline + 3 polls
 
     def test_unknown_resolution_blocks(self) -> None:
         _, result = self._run([complete("defer", "w1")])
@@ -1137,7 +1138,7 @@ class PollFailureTests(unittest.TestCase):
     def _run(self, poll_side_effect, **config):
         plugin = make_plugin(**config)
         plugin._client.request_hitl = Mock(return_value=pending("w1"))
-        plugin._client.get_hitl_decision = Mock(side_effect=poll_side_effect)
+        plugin._client.get_hitl_decision = Mock(side_effect=[BASELINE, *poll_side_effect])
         clock = FakeClock()
         with quiet(plugin), clock.installed():
             result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
@@ -1151,7 +1152,7 @@ class PollFailureTests(unittest.TestCase):
         self.assertEqual(result["action"], "block")
         self.assertIn("HTTP 429", result["message"])
         self.assertIn("call_limit_reached", result["message"])
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)  # baseline + 1 poll
         self.assertLess(clock.elapsed, 5)
 
     def test_poll_http_401_403_404_block_in_one_poll(self) -> None:
@@ -1160,7 +1161,7 @@ class PollFailureTests(unittest.TestCase):
                 plugin, result, _ = self._run([AmpClientError(f"HTTP {code}", status_code=code)])
                 assert result is not None
                 self.assertIn(f"HTTP {code}", result["message"])
-                self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+                self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)  # baseline + 1 poll
 
     def test_poll_http_429_blocks_even_when_fail_open(self) -> None:
         _, result, _ = self._run([AmpClientError("HTTP 429", status_code=429)], fail_closed=False)
@@ -1174,13 +1175,13 @@ class PollFailureTests(unittest.TestCase):
             complete("approve", "w1"),
         ])
         self.assertIsNone(result)
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 4)  # baseline + 3 polls
 
     def test_poll_unexpected_exception_keeps_polling_never_allows(self) -> None:
         plugin, result, _ = self._run([RuntimeError("boom"), complete("reject", "w1")], fail_closed=False)
         assert result is not None
         self.assertEqual(result["action"], "block")
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)  # baseline + 2 polls
 
     def test_amp_client_error_carries_status_code(self) -> None:
         from io import BytesIO

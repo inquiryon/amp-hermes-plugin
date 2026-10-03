@@ -81,6 +81,11 @@ def quiet(plugin: AmpGovernancePlugin, instance_id: str = "inst-1") -> Iterator[
         yield stack
 
 
+# K2.1: without action_id correlation every request is preceded by one baseline
+# get-decision. Prepend this to side_effect lists that script the polls.
+BASELINE = {"status": "pending"}
+
+
 def pending(workitem_id: str = "wi-1", **extra: Any) -> dict:
     return {"status": "pending", "workitem_id": workitem_id, **extra}
 

@@ -244,7 +244,8 @@ class PlanFailClosedTests(unittest.TestCase):
     def _run(self, decisions):
         plugin = _make_plugin()
         plugin._client.request_plan_approval = Mock(return_value=_hitl_response())
-        plugin._client.get_hitl_decision = Mock(side_effect=list(decisions))
+        # K2.1: one baseline get-decision precedes the request.
+        plugin._client.get_hitl_decision = Mock(side_effect=[{"status": "pending"}, *decisions])
         with patch.object(plugin, "_ensure_instance", return_value="inst-1"), \
              patch.object(plugin, "_safe_log"), patch("time.sleep", return_value=None):
             return plugin, plugin.evaluate_proposed_plan("s", _valid_plan(projected_cost_usd=4.75))
@@ -269,7 +270,7 @@ class PlanFailClosedTests(unittest.TestCase):
         plugin, result = self._run([AmpClientError("HTTP 429", status_code=429, body="call_limit_reached")])
         self.assertEqual(result["status"], "error")
         self.assertIn("HTTP 429", result["reason"])
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)  # baseline + 1 poll
 
     def test_plan_ignores_decision_for_other_workitem(self):
         plugin, result = self._run([
@@ -277,7 +278,7 @@ class PlanFailClosedTests(unittest.TestCase):
             _decision("approved"),
         ])
         self.assertEqual(result["status"], "approved")
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)  # baseline + 2 polls
 
 
 class ExecutionContextInteractionTests(unittest.TestCase):

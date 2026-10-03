@@ -296,9 +296,15 @@ Even then, `600 s` minus the margin is the ceiling, so reviewers have about **9.
 
 **Retries.** When a call gives up while its review is still open, the block message gives the workitem id and tells the model not to retry until a reviewer approves. If the model retries the **identical** call (same tool and arguments) in the same session, the plugin waits on the existing review instead of opening a new workitem. An approval given in the meantime then lets the retry through once.
 
-**Decisions are matched to the call.** AMP's decision poll is scoped to the AMP instance, not to the call. So the plugin binds each call to its own workitem id and ignores decisions for other workitems, for example an earlier approval on the same instance. An approval that carries no workitem id is not accepted unless `action_id` correlation proves it belongs to the call. One limit remains: AMP only returns the newest workitem of an instance. If a later call opens a newer workitem while an earlier one is still waiting, the earlier call cannot see its own decision and blocks when its window ends. With `AMP_ACTION_ID_CORRELATION=true`, AMP matches by `action_id` and this limit goes away.
+**Decisions are matched to the call.** AMP's decision poll is scoped to the AMP instance, not to the call. So the plugin binds each call to its own workitem id and ignores decisions for other workitems, for example an earlier approval on the same instance. An approval that carries no workitem id is not accepted unless `action_id` correlation proves it belongs to the call. With `AMP_ACTION_ID_CORRELATION=false` (the default), AMP can only report the newest workitem of the instance, so the plugin also:
 
-**One-shot runs.** `hermes -z` / `hermes chat -q` do not fire Hermes's session-finalize hook, so the plugin finishes the AMP session at the end of the turn. This is bounded to 3 s and best-effort. In one-shot mode Hermes captures stdout/stderr, so the `AMP: waiting for approval of …` line goes to the log, not the terminal.
+- runs **one review per session at a time**: a second governed call waits for the first to finish, and is blocked with "one approval at a time" if its own window ends first;
+- polls AMP **once before every governed request** (a "baseline"). Whatever workitem that poll reports existed before this call and is never accepted as its decision. This costs **one extra AMP call per governed action**, counted against the monthly call limit;
+- remembers the last 50 consumed or abandoned workitems per instance in `sessions.json`, so a restarted Hermes that reuses the AMP instance cannot act on an old approval.
+
+If the baseline poll fails, a 4xx blocks the call. A network error follows `AMP_FAIL_CLOSED`; even with fail-open, the call is then decided only by a workitem the plugin saw pending. With `AMP_ACTION_ID_CORRELATION=true`, AMP matches by `action_id`, and the lock and baseline are skipped.
+
+**One-shot runs.** `hermes -z` / `hermes chat -q` do not fire Hermes's session-finalize hook, so the plugin finishes the AMP session at the end of the turn. This is bounded to 3 s and best-effort. Under `hermes chat -q` goal loops that run several turns, each turn therefore gets its own AMP instance. In one-shot mode Hermes captures stdout/stderr, so the `AMP: waiting for approval of …` line goes to the log, not the terminal.
 
 ## Notification Bridge
 
