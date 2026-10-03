@@ -4,6 +4,7 @@ instance state after review (A16a)."""
 from __future__ import annotations
 
 import io
+import itertools
 import sys
 import unittest
 from unittest.mock import Mock, call, patch
@@ -56,15 +57,40 @@ class StaleDecisionGuardTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result["action"], "block")
 
-    def test_bound_call_ignores_decision_without_workitem_id(self) -> None:
+    def test_idless_terminal_decision_blocks_as_unverifiable(self) -> None:
+        # K2.2: a complete body without workitem_id (method auto/fallback) cannot be tied to
+        # this call; block at once instead of waiting out the window.
+        for method in ("auto", "fallback"):
+            with self.subTest(method=method):
+                plugin = make_plugin(hitl_timeout_minutes=1)
+                plugin._client.request_hitl = Mock(return_value=pending("wi-2"))
+                plugin._client.get_hitl_decision = Mock(side_effect=[
+                    BASELINE,
+                    {"status": "complete", "resolution": "approve", "method": method, "workitem_id": ""},
+                    complete("approve", "wi-2"),
+                ])
+                result = _governed(plugin)
+                self.assertIn("unverifiable decision", result["message"])
+                self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+
+    def test_unbound_call_never_accepts_a_terminal_decision(self) -> None:
+        # K2.2: binding only from the request response or a pending body.
         plugin = make_plugin(hitl_timeout_minutes=1)
-        plugin._client.request_hitl = Mock(return_value=pending("wi-2"))
-        plugin._client.get_hitl_decision = Mock(side_effect=[
-            {"status": "complete", "resolution": "approve"},
-            complete("approve", "wi-2"),
-        ])
-        self.assertIsNone(_governed(plugin))
-        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(side_effect=itertools.chain(
+            [BASELINE], itertools.repeat(complete("approve", "wi-9"))))
+        self.assertEqual(_governed(plugin)["action"], "block")
+
+    def test_network_error_at_window_end_is_not_reported_as_timeout(self) -> None:
+        from hermes.amp_client import AmpClientError
+
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value=pending("wi-1"))
+        plugin._client.get_hitl_decision = Mock(side_effect=itertools.chain(
+            [BASELINE], itertools.repeat(AmpClientError("connection refused"))))
+        message = _governed(plugin)["message"]
+        self.assertIn("unreachable", message)
+        self.assertNotIn("timed out", message)
 
     def test_first_pending_poll_binds_the_call(self) -> None:
         plugin = make_plugin(hitl_timeout_minutes=1)
@@ -258,10 +284,17 @@ class ReviewFindingTests(unittest.TestCase):
         self.assertNotEqual(outcome.kind, APPROVED)
 
     def test_unbound_reject_without_workitem_id_still_blocks_at_once(self) -> None:
-        from hermes.hitl_poll import REJECTED, DecisionLedger
+        from hermes.hitl_poll import UNVERIFIABLE, DecisionLedger
 
         outcome = self._poll(DecisionLedger(), {"status": "complete", "resolution": "reject", "method": "fallback"})
-        self.assertEqual(outcome.kind, REJECTED)
+        self.assertEqual(outcome.kind, UNVERIFIABLE)
+
+    def test_idless_approval_accepted_with_action_id_echo(self) -> None:
+        from hermes.hitl_poll import APPROVED, DecisionLedger
+
+        outcome = self._poll(DecisionLedger(), {"status": "complete", "resolution": "approve", "action_id": "c1"},
+                             action_id="c1")
+        self.assertEqual(outcome.kind, APPROVED)
         self.assertEqual(outcome.polls, 1)
 
     def test_init_4xx_blocks_even_when_fail_open(self) -> None:

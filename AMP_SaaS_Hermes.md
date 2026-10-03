@@ -302,6 +302,10 @@ Even then, `600 s` minus the margin is the ceiling, so reviewers have about **9.
 - polls AMP **once before every governed request** (a "baseline"). Whatever workitem that poll reports existed before this call and is never accepted as its decision. This costs **one extra AMP call per governed action**, counted against the monthly call limit;
 - remembers the last 50 consumed or abandoned workitems per instance in `sessions.json`, so a restarted Hermes that reuses the AMP instance cannot act on an old approval.
 
+- only accepts a decision for a workitem it is bound to (from the request response or a *pending* poll). A decision AMP cannot tie to a workitem (`method` `auto`/`fallback`) blocks at once as an "unverifiable decision";
+- when a request's workitem never appeared before the call gave up, blocks the next call on that instance for up to 5 minutes ("has not been registered yet"), so the late workitem cannot decide a different call;
+- also locks across Hermes processes on the same session (a file lock under `plugin_state/amp-governance/locks/`, POSIX only).
+
 If the baseline poll fails, a 4xx blocks the call. A network error follows `AMP_FAIL_CLOSED`; even with fail-open, the call is then decided only by a workitem the plugin saw pending. With `AMP_ACTION_ID_CORRELATION=true`, AMP matches by `action_id`, and the lock and baseline are skipped.
 
 **One-shot runs.** `hermes -z` / `hermes chat -q` do not fire Hermes's session-finalize hook, so the plugin finishes the AMP session at the end of the turn. This is bounded to 3 s and best-effort. Under `hermes chat -q` goal loops that run several turns, each turn therefore gets its own AMP instance. In one-shot mode Hermes captures stdout/stderr, so the `AMP: waiting for approval of …` line goes to the log, not the terminal.
@@ -625,6 +629,8 @@ The block message says why:
 | `… timed out waiting for AMP HITL approval` / `… did not complete within the …s Hermes limit` | Nobody decided in time (see [Approval window](#approval-window-hermes-time-limits)) |
 | `AMP rejected the governance request … (HTTP 4xx)` / `AMP rejected the HITL decision poll … (HTTP 4xx)` | AMP answered but refused: bad key, wrong org, monthly call limit (429), invalid payload |
 | `AMP governance is unavailable` | Network error or AMP 5xx (blocked because `AMP_FAIL_CLOSED=true`) |
+| `AMP was unreachable while waiting for the review …` | The decision polls failed with network errors / 5xx until the window ended (not a timeout) |
+| `… (unverifiable decision)` / `… has not been registered yet` | Decision-matching safeguards; see [Approval window](#approval-window-hermes-time-limits) |
 | `No active AMP governance policy …` / an AMP policy message | The agent has no active eval policy, or its HITL routing is invalid |
 
 Also check:

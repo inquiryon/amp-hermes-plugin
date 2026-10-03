@@ -16,9 +16,14 @@ Contract K2.1 (action_id correlation off): AMP's get-decision returns the
 instance's newest workitem (ORDER BY created DESC LIMIT 1, any status). The
 caller holds a per-instance lock, polls once *before* its request, and passes
 that workitem as ``foreign``: it existed before this call, so it is never
-bound or accepted. ``accept_unbound=False`` (baseline unknown) means a
-decision is only accepted for a workitem bound via a pending poll or the
-request response.
+bound or accepted. ``accept_unbound=False`` (baseline failed) means the call
+may only be bound by the request response, never by a pending poll.
+
+Contract K2.2 (action_id correlation off): a terminal (``complete``) decision is
+only accepted for the bound workitem; an unbound call binds only from the
+request response or a *pending* body. A terminal body without a workitem_id
+blocks at once as unverifiable. With correlation on, AMP's action_id echo
+proves ownership and such decisions are accepted.
 """
 
 from __future__ import annotations
@@ -54,8 +59,16 @@ TIMED_OUT = "timed_out"
 BUDGET_EXHAUSTED = "budget_exhausted"
 POLL_REJECTED = "poll_rejected"
 CORRELATION_FAILED = "correlation_failed"
+# A terminal decision AMP could not tie to a workitem (method auto/fallback, legacy
+# "workitem not created" path) while action_id correlation is off (contract K2.2).
+UNVERIFIABLE = "unverifiable"
+# The window ended while the last decision polls failed (network error / 5xx), so the
+# outcome is "AMP unreachable", not "nobody decided" (K2.2).
+UNAVAILABLE = "unavailable"
 
-TERMINAL_KINDS = frozenset({APPROVED, MODIFIED, REJECTED, CANCELLED, POLL_REJECTED, CORRELATION_FAILED})
+TERMINAL_KINDS = frozenset(
+    {APPROVED, MODIFIED, REJECTED, CANCELLED, POLL_REJECTED, CORRELATION_FAILED, UNVERIFIABLE}
+)
 
 
 @dataclass(frozen=True)
@@ -244,6 +257,7 @@ def _poll(
 ) -> PollOutcome:
     started = time.time()
     polls = 0
+    last_error = ""
     while True:
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -259,10 +273,13 @@ def _poll(
                     detail=exc.body or str(exc), polls=polls,
                 )
             logger.warning("amp-governance %sdecision poll failed: %s", label, exc)
+            last_error = str(exc)
             continue
         except Exception as exc:  # never let a poll error turn into an allow
             logger.warning("amp-governance %sdecision poll failed: %s", label, exc)
+            last_error = str(exc)
             continue
+        last_error = ""
         if not isinstance(decision, dict):
             continue
 
@@ -278,12 +295,14 @@ def _poll(
         if status == "complete":
             resolution = _lower(decision.get("resolution"))
             if not workitem_id:
-                # Cannot prove the decision is ours. Only a correlated (action_id-echoed)
-                # or tighten-only decision may be taken without a workitem id.
-                if bound or (resolution in _APPROVE | _MODIFY and action_id is None):
-                    continue
-            elif workitem_id != bound and not accept_unbound:
-                continue  # baseline unknown: only a workitem seen pending (bound) is provably ours
+                if action_id is None:
+                    # K2.2: nothing ties this decision to our call; never wait it out.
+                    return PollOutcome(
+                        UNVERIFIABLE, bound, information=str(decision.get("information") or "").strip(),
+                        detail=_lower(decision.get("method")) or "unknown", polls=polls,
+                    )
+            elif workitem_id != bound and action_id is None:
+                continue  # K2.2: an unbound call never accepts a terminal decision
             elif not ledger.try_consume(instance_id, workitem_id, owner):
                 continue  # consumed by another poll in the meantime
             information = str(decision.get("information") or "").strip()
@@ -301,12 +320,14 @@ def _poll(
             return PollOutcome(kind, workitem_id or bound, information=information, polls=polls)
 
         if status in _CANCELLED or _lower(decision.get("workitem_status")) in _CANCELLED:
+            if workitem_id and workitem_id != bound and action_id is None:
+                continue  # another call's cancelled workitem
             ledger.mark_spent(instance_id, workitem_id)
             information = str(decision.get("information") or "").strip()
             return PollOutcome(CANCELLED, workitem_id or bound, information=information, polls=polls)
 
         # pending (or an unrecognised status): keep waiting on this call's workitem
-        if not bound and workitem_id and ledger.claim(instance_id, workitem_id, owner):
+        if not bound and workitem_id and accept_unbound and ledger.claim(instance_id, workitem_id, owner):
             bound = workitem_id
         if (
             action_id is not None
@@ -316,4 +337,6 @@ def _poll(
         ):
             return PollOutcome(CORRELATION_FAILED, bound, detail="watchdog", polls=polls)
 
+    if last_error:
+        return PollOutcome(UNAVAILABLE, bound, detail=last_error, polls=polls)
     return PollOutcome(BUDGET_EXHAUSTED if budget_limited else TIMED_OUT, bound, polls=polls)

@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from hermes.amp_client import AmpClientError
+from hermes.policy import NormalizedAction
 from hermes.session_store import SessionRecord, SessionStore
 from hitl_helpers import FakeClock, complete, make_plugin, pending, quiet
 
@@ -235,3 +236,176 @@ class PersistedSpentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _RowBackend:
+    """Instance-scoped like AMP: newest row by `created` (1 s precision), any status."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+        self.rows = []
+        self.on_poll = []
+        self.polls = 0
+        self.requests = 0
+
+    def add(self, wid, created=None):
+        self.rows.append({"id": wid, "created": int(self.clock.now if created is None else created),
+                          "status": "Pending", "resolution": None})
+
+    def set(self, wid, resolution):
+        for row in self.rows:
+            if row["id"] == wid:
+                row["status"], row["resolution"] = "Complete", resolution
+
+    def get_decision(self, *_a, **_k):
+        self.polls += 1
+        for hook in list(self.on_poll):
+            hook(self.polls)
+        if not self.rows:
+            return {"status": "pending"}
+        top = max(r["created"] for r in self.rows)
+        row = [r for r in self.rows if r["created"] == top][-1]
+        if row["status"] == "Complete":
+            return complete(row["resolution"], row["id"])
+        return pending(row["id"])
+
+    def request(self, *_a, **_k):
+        self.requests += 1
+        return {"status": "waiting-for-response"}
+
+
+class K21ReviewFindingTests(unittest.TestCase):
+    """Gate 2/3 findings on K2.1: late workitems, cross-process, budget, action_id path."""
+
+    def _call(self, plugin, clock, command, **kwargs):
+        with quiet(plugin), clock.installed():
+            return plugin.pre_tool_call(tool_name="terminal", args={"command": command}, session_id="s1", **kwargs)
+
+    def test_late_workitem_of_unbound_call_never_decides_the_next_call(self) -> None:
+        clock = FakeClock()
+        backend = _RowBackend(clock)
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.get_hitl_decision = Mock(side_effect=backend.get_decision)
+        plugin._client.request_hitl = Mock(side_effect=backend.request)
+        self.assertEqual(self._call(plugin, clock, "ls")["action"], "block")  # A: no workitem ever seen
+        state = {}
+
+        def late_rows(n):
+            if "a" not in state and backend.requests == 2:
+                backend.add("W-A-benign")
+                state["a"] = n
+            if "a" in state and n >= state["a"] + 2:
+                backend.set("W-A-benign", "approve")
+
+        backend.on_poll.append(late_rows)
+        result = self._call(plugin, clock, "rm -rf /")
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+
+    def test_next_call_waits_while_previous_review_is_unregistered(self) -> None:
+        clock = FakeClock()
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})
+        self._call(plugin, clock, "ls")
+        plugin._client.request_hitl.reset_mock()
+        result = self._call(plugin, clock, "pwd")
+        self.assertIn("not been registered", result["message"])
+        plugin._client.request_hitl.assert_not_called()
+
+    def test_unregistered_marker_expires(self) -> None:
+        clock = FakeClock()
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})
+        self._call(plugin, clock, "ls")
+        clock.now += 3600
+        plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        self.assertIsNone(self._call(plugin, clock, "pwd"))
+
+    def test_new_row_after_unregistered_call_is_treated_as_spent(self) -> None:
+        clock = FakeClock()
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})
+        self._call(plugin, clock, "ls")
+        plugin._client.get_hitl_decision = Mock(return_value=pending("W-late"))  # A's row finally exists
+        plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        self.assertIsNone(self._call(plugin, clock, "pwd"))
+        self.assertTrue(plugin._ledger.is_spent("inst-1", "W-late"))
+
+    def test_two_processes_on_one_instance_cannot_swap(self) -> None:
+        clock = FakeClock()
+        backend = _RowBackend(clock)
+        first, second = make_plugin(), make_plugin()  # same HERMES_HOME = same state dir
+        for plugin in (first, second):
+            plugin._client.get_hitl_decision = Mock(side_effect=backend.get_decision)
+        danger = NormalizedAction("terminal", "exec", "exec", {"command": "rm -rf /"})
+        benign = NormalizedAction("terminal", "exec", "exec", {"command": "ls"})
+        nested = {}
+
+        def second_request(*_a, **_k):
+            backend.add("W-2-benign")
+            return {"status": "waiting-for-response"}
+
+        def first_request(*_a, **_k):
+            backend.add("W-1-danger")
+            clock.now += 1
+            nested["second"] = second._evaluate_governance("inst-1", benign)
+            return {"status": "waiting-for-response"}
+
+        first._client.request_hitl = Mock(side_effect=first_request)
+        second._client.request_hitl = Mock(side_effect=second_request)
+        backend.on_poll.append(lambda n: backend.set("W-2-benign", "approve") if n > 3 else None)
+        with quiet(first), quiet(second), clock.installed():
+            result = first._evaluate_governance("inst-1", danger)
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertEqual(nested["second"]["action"], "block")
+        second._client.request_hitl.assert_not_called()
+
+    def test_action_id_path_also_takes_the_instance_lock(self) -> None:
+        plugin = make_plugin(action_id_correlation=True, hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        lock = plugin._instance_lock("inst-1")
+        lock.acquire()
+        try:
+            result = self._call(plugin, FakeClock(), "ls", tool_call_id="c1")
+        finally:
+            lock.release()
+        self.assertIn("One approval at a time", result["message"])
+        plugin._client.request_hitl.assert_not_called()
+
+    def test_no_request_when_budget_is_gone_before_posting(self) -> None:
+        clock = FakeClock()
+        plugin = make_plugin(hitl_timeout_minutes=1)
+
+        def slow_baseline(*_a, **_k):
+            clock.now += 59  # budget ends at +45 (60 - 15 margin)
+            return {"status": "pending"}
+
+        plugin._client.get_hitl_decision = Mock(side_effect=slow_baseline)
+        plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        result = self._call(plugin, clock, "ls")
+        self.assertEqual(result["action"], "block")
+        plugin._client.request_hitl.assert_not_called()
+
+    def test_baseline_failure_never_binds_via_pending_poll(self) -> None:
+        plugin = make_plugin(fail_closed=False, hitl_timeout_minutes=1)
+        plugin._client.get_hitl_decision = Mock(side_effect=itertools.chain(
+            [AmpClientError("connection refused"), pending("wi-x")],
+            itertools.repeat(complete("approve", "wi-x")),
+        ))
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        self.assertEqual(_governed(plugin)["action"], "block")
+
+    def test_llm_path_blocks_without_instance_id(self) -> None:
+        from test_enforcement import _make_exec_ctx
+
+        plugin = make_plugin(llm_governance_enabled=True, llm_governance_mode="enforce")
+        exec_ctx = _make_exec_ctx(instance_id="")
+        plugin._client.request_llm_hitl = Mock(return_value={"status": "no-hitl"})
+        with patch.object(plugin, "_safe_log"), FakeClock().installed():
+            decision, _ = plugin._evaluate_llm_governance(exec_ctx, "m", "p", "", "s1", {"messages": []}, 1)
+        self.assertEqual(decision, "block")
+        plugin._client.request_llm_hitl.assert_not_called()
