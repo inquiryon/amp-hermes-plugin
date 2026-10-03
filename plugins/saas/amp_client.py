@@ -65,7 +65,7 @@ _BEST_EFFORT_CAP_SECONDS = 2.0
 
 
 @contextmanager
-def request_deadline(at: Optional[float], *, hard: bool = False) -> Iterator[None]:
+def request_deadline(at: Optional[float], *, hard: bool = False, grace: float = 1.0) -> Iterator[None]:
     """Bound every AMP HTTP call made on this thread by the absolute time ``at``.
 
     Each request's socket timeout becomes ``min(30 s, at - now)``. With
@@ -74,10 +74,11 @@ def request_deadline(at: Optional[float], *, hard: bool = False) -> Iterator[Non
     request is always attempted and the caller decides what an exhausted budget
     means. With ``hard=True`` (best-effort cleanup at exit) a request made after
     the deadline raises ``AmpClientError`` immediately instead.
-    ``at=None`` leaves the default 30 s timeout in place.
+    ``at=None`` leaves the default 30 s timeout in place. ``grace`` is how far past
+    ``at`` a session-store lock wait may run (see current_grace).
     """
     previous = getattr(_deadline_state, "value", None)
-    _deadline_state.value = (at, hard) if at is not None else None
+    _deadline_state.value = (at, hard, grace) if at is not None else None
     try:
         yield
     finally:
@@ -88,6 +89,12 @@ def current_deadline() -> Optional[float]:
     """The calling thread's governance deadline, if any (used to bound store-lock waits)."""
     state = getattr(_deadline_state, "value", None)
     return None if state is None else state[0]
+
+
+def current_grace() -> float:
+    """How far past current_deadline() a store-lock wait may run (default 1 s)."""
+    state = getattr(_deadline_state, "value", None)
+    return 1.0 if state is None else state[2]
 
 
 def window_open() -> bool:
@@ -112,7 +119,7 @@ def _http_timeout() -> float:
     state = getattr(_deadline_state, "value", None)
     if state is None:
         return _DEFAULT_HTTP_TIMEOUT_SECONDS
-    at, hard = state
+    at, hard = state[0], state[1]
     remaining = at - time.time()
     if remaining <= 0 and hard:
         # Not an outage: never usable as a fail-open reason.

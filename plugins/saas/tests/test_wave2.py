@@ -454,3 +454,44 @@ class Wave2bReviewTests(unittest.TestCase):
         with request_deadline(_time.time() - 1, hard=True), self.assertRaises(AmpClientError) as ctx:
             client.get_hitl_decision("inst-1")
         self.assertFalse(ctx.exception.pre_send)
+
+
+class Wave2cLowTests(unittest.TestCase):
+    """Wave 2c: the three LOWs left by the d5283f5 confirmation review."""
+
+    def test_busy_store_returns_inside_small_hook_windows(self) -> None:
+        import fcntl
+        import os
+
+        for hook in (1.0, 4.0):
+            with self.subTest(hook=hook):
+                plugin = make_plugin(fail_closed=False)
+                plugin._store.put(SessionRecord("s1", "inst-1"))
+                fd = os.open(f"{plugin._store._path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX)  # another Hermes process holds sessions.json
+                try:
+                    clock = FakeClock()
+                    with patch.object(plugin_mod, "hook_timeout_seconds", lambda h=hook: h), \
+                            patch.object(plugin, "_safe_log"), clock.installed():
+                        result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"},
+                                                      session_id="s1")
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                self.assertEqual(result["action"], "block")
+                self.assertLess(clock.elapsed, hook)
+
+    def test_busy_store_message_says_busy_not_unregistered(self) -> None:
+        from hermes.session_store import StoreLockError
+
+        plugin = make_plugin()
+        plugin._client.get_hitl_decision = Mock(return_value=BASELINE)
+        plugin._store.get_unregistered = Mock(side_effect=StoreLockError("busy"))
+        message = _call(plugin, FakeClock(), "ls")["message"]
+        self.assertIn("session store is busy", message)
+        self.assertNotIn("not been registered", message)
+
+    def test_post_tool_call_normalizer_crash_does_not_raise(self) -> None:
+        plugin = make_plugin()
+        with patch.object(plugin_mod, "normalize_tool_call", side_effect=RecursionError("deep")):
+            plugin.post_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1", status="ok")

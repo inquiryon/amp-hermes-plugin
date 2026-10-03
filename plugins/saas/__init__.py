@@ -195,6 +195,8 @@ class _ReviewSlot:
     baselined: bool = False
     # Not acquired because cross-process locking is unavailable (not merely busy).
     lock_unavailable: bool = False
+    # The session store (pending-review marker) could not be read in time.
+    store_unreadable: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +726,8 @@ class AmpGovernancePlugin:
             marker = self._get_marker(instance_id)
         except Exception as exc:
             logger.warning("amp-governance: cannot read pending-review marker (%s); blocking", exc)
-            return _ReviewSlot(acquired=True, unregistered=True, baseline_workitem=newest, baselined=True)
+            return _ReviewSlot(acquired=True, unregistered=True, store_unreadable=True,
+                               baseline_workitem=newest, baselined=True)
         if marker is not None:
             marker_newest, noted_at = marker
             if time.time() - noted_at >= _UNREGISTERED_REVIEW_TTL_SECONDS:
@@ -790,6 +793,14 @@ class AmpGovernancePlugin:
             f"Another governed call in this session is still waiting for AMP review; "
             f"{subject} was blocked. One approval at a time: retry after that review."
         )
+
+    def _slot_unregistered_message(self, slot: _ReviewSlot, subject: str) -> str:
+        if slot.store_unreadable:
+            return (
+                f"The AMP session store is busy (locked by another Hermes process); {subject} "
+                "was blocked. Retry shortly."
+            )
+        return self._unregistered_message(subject)
 
     def _unregistered_message(self, subject: str) -> str:
         return (
@@ -892,7 +903,7 @@ class AmpGovernancePlugin:
             if slot.unregistered:
                 exec_ctx.llm_blocked += 1
                 exec_ctx.status = "blocked"
-                return "block", self._unregistered_message("the LLM call")
+                return "block", self._slot_unregistered_message(slot, "the LLM call")
             if slot.error is not None:
                 refused_code = _http_client_error_code(slot.error)
                 if refused_code is not None or self._config.llm_governance_fail_closed:
@@ -1253,7 +1264,7 @@ class AmpGovernancePlugin:
             if not slot.acquired:
                 return self._block_message(self._slot_refused_message(slot, action.raw_tool_name))
             if slot.unregistered:
-                return self._block_message(self._unregistered_message(action.raw_tool_name))
+                return self._block_message(self._slot_unregistered_message(slot, action.raw_tool_name))
             return self._evaluate_governance_in_slot(
                 instance_id, action, budget=budget, action_id=action_id,
                 call_fingerprint=call_fingerprint, slot=slot,
@@ -1595,7 +1606,7 @@ class AmpGovernancePlugin:
         instance init and submission, runs under the Hermes tool deadline (F3)."""
         started_at = time.time()
         budget = self._wait_budget(started_at, include_hook=False)
-        with request_deadline(budget.deadline):
+        with request_deadline(budget.deadline, grace=budget.grace_seconds):
             return self._evaluate_proposed_plan(session_id, plan, started_at)
 
     def _evaluate_proposed_plan(self, session_id: str, plan: Dict[str, Any], started_at: float) -> Dict[str, Any]:
@@ -1653,7 +1664,8 @@ class AmpGovernancePlugin:
                     "error", plan_id=plan_id, reason=self._slot_refused_message(slot, "the plan", scoped_possible=False),
                 )
             if slot.unregistered:
-                return self._plan_result("error", plan_id=plan_id, reason=self._unregistered_message("the plan"))
+                return self._plan_result("error", plan_id=plan_id,
+                                         reason=self._slot_unregistered_message(slot, "the plan"))
             if budget.deadline - time.time() < max(float(self._config.hitl_poll_interval_seconds), 1.0) + 1.0:
                 return self._plan_result(
                     "timed_out", plan_id=plan_id,
@@ -2030,7 +2042,7 @@ class AmpGovernancePlugin:
         if getattr(self._config, "action_id_correlation", False):
             action_id = str(tool_call_id or "").strip() or uuid.uuid4().hex
         try:
-            with request_deadline(budget.deadline):
+            with request_deadline(budget.deadline, grace=budget.grace_seconds):
                 instance_id = self._ensure_instance(session_id, model=model, platform=platform)
                 decision = self._evaluate_governance(
                     instance_id, action, budget=budget, action_id=action_id,
@@ -2073,7 +2085,11 @@ class AmpGovernancePlugin:
         result: Any = None,
         **_: Any,
     ) -> None:
-        action = normalize_tool_call(tool_name, args)
+        try:
+            action = normalize_tool_call(tool_name, args)
+        except Exception as exc:  # an observer hook must never raise into Hermes
+            logger.warning("amp-governance could not inspect %s result: %s", tool_name, exc)
+            return
         if action is None:
             return
         if not self._config.is_configured:

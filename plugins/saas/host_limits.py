@@ -80,6 +80,14 @@ class WaitBudget:
     deadline: float          # absolute time.time() value
     limit_seconds: float     # the binding limit before the safety margin
     host_limit_name: str     # Hermes setting that binds; "" when AMP_HITL_TIMEOUT_MINUTES binds
+    margin_seconds: float = 0.0  # deadline = start + limit - margin
+
+    @property
+    def grace_seconds(self) -> float:
+        """Extra time a post-deadline bookkeeping write (e.g. the late-workitem marker) may
+        wait for the session-store lock: at most half the margin, so it stays inside the
+        Hermes limit even for small hook budgets."""
+        return min(1.0, 0.5 * self.margin_seconds)
 
     @property
     def host_limited(self) -> bool:
@@ -101,7 +109,9 @@ def compute_budget(
     # Ties go to the AMP timeout (listed first): its message is the familiar one.
     limit, name = min(candidates, key=lambda item: item[0])
     margin = min(MARGIN_CAP_SECONDS, MARGIN_FRACTION * limit)
-    return WaitBudget(deadline=started_at + limit - margin, limit_seconds=limit, host_limit_name=name)
+    return WaitBudget(
+        deadline=started_at + limit - margin, limit_seconds=limit, host_limit_name=name, margin_seconds=margin
+    )
 
 
 def limits_shorter_than(seconds: float) -> List[Tuple[str, float]]:

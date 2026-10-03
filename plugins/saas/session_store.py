@@ -35,15 +35,16 @@ _KEY_DIGEST_RE = re.compile(r"^[0-9a-f]{%d}$" % _KEY_DIGEST_CHARS)
 # How long a store operation waits for another Hermes process holding sessions.json.
 _STORE_LOCK_TIMEOUT_SECONDS = 5.0
 _STORE_LOCK_POLL_SECONDS = 0.02
-_STORE_LOCK_GRACE_SECONDS = 1.0
 
 
 def _governance_deadline() -> Optional[float]:
+    """Latest time a store-lock wait may end: the governance deadline plus its grace."""
     try:
-        from .amp_client import current_deadline
+        from .amp_client import current_deadline, current_grace
     except ImportError:  # imported standalone (tests of this module alone)
         return None
-    return current_deadline()
+    deadline = current_deadline()
+    return None if deadline is None else deadline + current_grace()
 
 
 class StoreLockError(OSError):
@@ -155,9 +156,9 @@ class SessionStore:
         deadline = time.time() + self._lock_timeout
         governance_deadline = _governance_deadline()
         if governance_deadline is not None:
-            # Never outlast the hook's window; a short grace still lets the marker/spent
-            # write that follows a timed-out review land inside the safety margin.
-            deadline = min(deadline, governance_deadline + _STORE_LOCK_GRACE_SECONDS)
+            # Never outlast the hook's window; the grace (<= half the margin, <= 1 s) still
+            # lets the marker/spent write that follows a timed-out review land in time.
+            deadline = min(deadline, governance_deadline)
         if not self._thread_lock.acquire(timeout=max(deadline - time.time(), 0.0)):
             raise StoreLockError("session store busy (thread lock)")
         fd = None
