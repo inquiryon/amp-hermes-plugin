@@ -1,0 +1,153 @@
+"""A15 (content preview, gate C9) and A9 (unlisted tools, gate C5): both default OFF."""
+
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path
+import unittest
+from unittest.mock import Mock
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from policy import (  # noqa: E402  (same import style as test_policy.py)
+    CONTENT_PREVIEW_LIMIT_BYTES,
+    normalize_tool_call,
+    redact_secrets,
+)
+from hermes.config import AmpConfig  # noqa: E402
+from hitl_helpers import make_plugin, quiet  # noqa: E402
+
+AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+AMP_KEY = "amp_k_test_abcdef0123456789"
+
+
+class ContentPreviewTests(unittest.TestCase):
+    def test_off_by_default(self) -> None:
+        action = normalize_tool_call("write_file", {"path": "/tmp/a", "content": "hello"})
+        self.assertNotIn("content_preview", action.context)
+        self.assertNotIn("content_sha256", action.context)
+
+    def test_write_file_preview_hash_and_size(self) -> None:
+        action = normalize_tool_call(
+            "write_file", {"path": "/tmp/a", "content": "hello"}, include_content_preview=True
+        )
+        self.assertEqual(action.context["content_preview"], "hello")
+        self.assertEqual(action.context["content_sha256"], hashlib.sha256(b"hello").hexdigest())
+        self.assertEqual(action.context["content_bytes"], 5)
+        self.assertFalse(action.context["content_preview_truncated"])
+        self.assertEqual(action.context["path"], "/tmp/a")
+
+    def test_preview_capped_at_2kb_but_hash_covers_full_content(self) -> None:
+        content = "x" * 10_000
+        ctx = normalize_tool_call(
+            "write_file", {"path": "/a", "content": content}, include_content_preview=True
+        ).context
+        self.assertTrue(ctx["content_preview_truncated"])
+        self.assertLessEqual(len(ctx["content_preview"].encode()), CONTENT_PREVIEW_LIMIT_BYTES + 20)
+        self.assertEqual(ctx["content_bytes"], 10_000)
+        self.assertEqual(ctx["content_sha256"], hashlib.sha256(content.encode()).hexdigest())
+
+    def test_multibyte_truncation_stays_valid_utf8(self) -> None:
+        ctx = normalize_tool_call(
+            "write_file", {"path": "/a", "content": "é" * 5000}, include_content_preview=True
+        ).context
+        ctx["content_preview"].encode("utf-8")  # must not raise
+
+    def test_secrets_redacted_from_preview(self) -> None:
+        content = f"aws={AWS_KEY}\npassword = hunter2hunter2\nkey: {AMP_KEY}\n"
+        ctx = normalize_tool_call(
+            "write_file", {"path": "/a/.env", "content": content}, include_content_preview=True
+        ).context
+        for secret in (AWS_KEY, "hunter2hunter2", AMP_KEY):
+            self.assertNotIn(secret, ctx["content_preview"])
+
+    def test_private_key_block_redacted(self) -> None:
+        pem = "-----BEGIN RSA " "PRIVATE KEY-----\nMIIEow\n-----END RSA " "PRIVATE KEY-----"
+        self.assertNotIn("MIIEow", redact_secrets(pem))
+
+    def test_patch_preview_shows_old_and_new(self) -> None:
+        ctx = normalize_tool_call(
+            "patch", {"path": "/a.py", "old_string": "x = 1", "new_string": "x = 2"},
+            include_content_preview=True,
+        ).context
+        self.assertIn("x = 1", ctx["content_preview"])
+        self.assertIn("x = 2", ctx["content_preview"])
+
+    def test_patch_v4a_body_is_previewed(self) -> None:
+        ctx = normalize_tool_call(
+            "patch", {"mode": "patch", "patch": "*** Begin Patch\n+new line"}, include_content_preview=True,
+        ).context
+        self.assertIn("+new line", ctx["content_preview"])
+
+    def test_non_write_tools_never_carry_content(self) -> None:
+        ctx = normalize_tool_call("terminal", {"command": "ls"}, include_content_preview=True).context
+        self.assertNotIn("content_preview", ctx)
+
+    def test_plugin_sends_preview_only_when_flag_on(self) -> None:
+        for flag in (False, True):
+            with self.subTest(flag=flag):
+                plugin = make_plugin(send_content_preview=flag)
+                plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+                with quiet(plugin):
+                    plugin.pre_tool_call(tool_name="write_file", args={"path": "/a", "content": "hi"}, session_id="s")
+                sent = plugin._client.request_hitl.call_args.args[1].context
+                self.assertEqual("content_preview" in sent, flag)
+
+
+class UnlistedToolTests(unittest.TestCase):
+    def test_unlisted_tool_ignored_by_default(self) -> None:
+        self.assertIsNone(normalize_tool_call("execute_code", {"code": "print(1)"}))
+
+    def test_unlisted_tool_governed_when_flag_on(self) -> None:
+        action = normalize_tool_call("execute_code", {"code": "print(1)"}, govern_unlisted=True)
+        self.assertEqual((action.tool, action.action), ("execute_code", "invoke"))
+        self.assertIn("print(1)", action.context["arguments"])
+
+    def test_own_amp_tools_never_governed(self) -> None:
+        self.assertIsNone(normalize_tool_call("amp_governance_summary", {}, govern_unlisted=True))
+
+    def test_secret_like_args_redacted(self) -> None:
+        ctx = normalize_tool_call(
+            "http_request",
+            {"url": "https://x", "headers": {"Authorization": "Bearer abc123def456"}, "api_key": "zzz-secret"},
+            govern_unlisted=True,
+        ).context
+        self.assertNotIn("zzz-secret", ctx["arguments"])
+        self.assertNotIn("abc123def456", ctx["arguments"])
+        self.assertIn("https://x", ctx["arguments"])
+
+    def test_long_args_truncated(self) -> None:
+        ctx = normalize_tool_call("execute_code", {"code": "y" * 9000}, govern_unlisted=True).context
+        self.assertTrue(ctx["arguments_truncated"])
+        self.assertLess(len(ctx["arguments"]), 2100)
+
+    def test_listed_tools_unchanged_with_flag_on(self) -> None:
+        action = normalize_tool_call("terminal", {"command": "ls"}, govern_unlisted=True)
+        self.assertEqual((action.tool, action.action), ("exec", "exec"))
+
+    def test_plugin_governs_unlisted_tool_only_when_flag_on(self) -> None:
+        plugin = make_plugin()
+        plugin._client.request_hitl = Mock(return_value={"status": "no_policy"})
+        with quiet(plugin):
+            self.assertIsNone(plugin.pre_tool_call(tool_name="execute_code", args={"code": "1"}, session_id="s"))
+        plugin._client.request_hitl.assert_not_called()
+
+        plugin = make_plugin(govern_unlisted_tools=True)
+        plugin._client.request_hitl = Mock(return_value={"status": "no_policy"})
+        with quiet(plugin):
+            result = plugin.pre_tool_call(tool_name="execute_code", args={"code": "1"}, session_id="s")
+        self.assertEqual(result["action"], "block")
+
+
+class FlagDefaultsTests(unittest.TestCase):
+    def test_flags_default_off(self) -> None:
+        cfg = AmpConfig("u", "k", "o", "a", "n", 10, 3, True, True, True, "observe", False, True)
+        self.assertFalse(cfg.send_content_preview)
+        self.assertFalse(cfg.govern_unlisted_tools)
+
+
+if __name__ == "__main__":
+    unittest.main()

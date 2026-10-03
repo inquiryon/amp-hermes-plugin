@@ -97,6 +97,10 @@ class AmpConfig:
     action_id_correlation: bool = False
     # Block when an action_id-scoped review still has no workitem after this many seconds.
     action_id_watchdog_seconds: int = 60
+    # Phase 1, gated (C9): send a redacted <= 2 KB preview + hash of write_file/patch content.
+    send_content_preview: bool = False
+    # Phase 1, gated (C5): govern tools outside the default allowlist (one AMP call each).
+    govern_unlisted_tools: bool = False
 
     @property
     def is_configured(self) -> bool:
@@ -145,4 +149,6 @@ def load_config() -> AmpConfig:
         llm_governance_include_subagents=_bool_value(env_file, True, "AMP_LLM_GOVERNANCE_INCLUDE_SUBAGENTS"),
         action_id_correlation=_bool_value(env_file, False, "AMP_ACTION_ID_CORRELATION"),
         action_id_watchdog_seconds=_int_value(env_file, 60, "AMP_ACTION_ID_WATCHDOG_SECONDS"),
+        send_content_preview=_bool_value(env_file, False, "AMP_SEND_CONTENT_PREVIEW"),
+        govern_unlisted_tools=_bool_value(env_file, False, "AMP_GOVERN_UNLISTED_TOOLS"),
     )
