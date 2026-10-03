@@ -45,7 +45,7 @@ class AmpClientError(RuntimeError):
     (None for network errors, timeouts and exhausted deadlines); ``body`` is
     the raw response body AMP sent with that status, if any. ``pre_send`` is True
     only when the request provably never reached AMP (connection refused, DNS
-    failure, deadline already exhausted): the only case fail-open may allow."""
+    failure): the only case fail-open may allow."""
 
     def __init__(
         self, message: str, *, status_code: Optional[int] = None, body: str = "", pre_send: bool = False
@@ -84,6 +84,12 @@ def request_deadline(at: Optional[float], *, hard: bool = False) -> Iterator[Non
         _deadline_state.value = previous
 
 
+def current_deadline() -> Optional[float]:
+    """The calling thread's governance deadline, if any (used to bound store-lock waits)."""
+    state = getattr(_deadline_state, "value", None)
+    return None if state is None else state[0]
+
+
 def window_open() -> bool:
     """False once the calling thread's governance deadline has passed."""
     state = getattr(_deadline_state, "value", None)
@@ -109,7 +115,10 @@ def _http_timeout() -> float:
     at, hard = state
     remaining = at - time.time()
     if remaining <= 0 and hard:
-        raise AmpClientError("AMP request deadline exhausted", pre_send=True)
+        # Not an outage: never usable as a fail-open reason.
+        raise AmpClientError("AMP request deadline exhausted")
+    if hard:
+        return min(_DEFAULT_HTTP_TIMEOUT_SECONDS, remaining)  # no floor: never past the deadline
     return min(_DEFAULT_HTTP_TIMEOUT_SECONDS, max(remaining, _MIN_HTTP_TIMEOUT_SECONDS))
 
 

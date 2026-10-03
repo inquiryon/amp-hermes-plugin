@@ -335,3 +335,122 @@ class DeferWordingTests(unittest.TestCase):
         plugin._client.get_hitl_decision = Mock(side_effect=[BASELINE, AUTO])
         plugin._client.request_hitl = Mock(return_value=pending("wi-1"))
         self.assertIn("unverifiable", _call(plugin, FakeClock(), "ls")["message"])
+
+
+class Wave2bReviewTests(unittest.TestCase):
+    """Gate-2/3 review of e6000c7 (MEDIUMs + cheap LOWs)."""
+
+    def test_marker_read_failure_fails_closed(self) -> None:
+        from hermes.session_store import StoreLockError
+
+        plugin = make_plugin()
+        plugin._client.get_hitl_decision = Mock(return_value=BASELINE)
+        plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        plugin._store.get_unregistered = Mock(side_effect=StoreLockError("busy"))
+        result = _call(plugin, FakeClock(), "ls")
+        self.assertEqual(result["action"], "block")
+        plugin._client.request_hitl.assert_not_called()
+
+    def test_unseeded_ledger_never_binds_from_pending(self) -> None:
+        from hermes.session_store import StoreLockError
+
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._store.spent_for_instance = Mock(side_effect=StoreLockError("busy"))
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(side_effect=itertools.chain(
+            [BASELINE, pending("wi-x")], itertools.repeat(complete("approve", "wi-x"))))
+        self.assertEqual(_call(plugin, FakeClock(), "ls")["action"], "block")
+
+    def test_refused_outage_does_not_set_marker(self) -> None:
+        plugin = make_plugin(fail_closed=False)
+        plugin._client.get_hitl_decision = Mock(return_value=BASELINE)
+        plugin._client.request_hitl = Mock(side_effect=AmpClientError("refused", pre_send=True))
+        clock = FakeClock()
+        self.assertIsNone(_call(plugin, clock, "ls"))
+        plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        self.assertIsNone(_call(plugin, clock, "pwd"))  # AMP is back: no 5-minute pause
+
+    def test_store_lock_wait_respects_the_governance_deadline(self) -> None:
+        import fcntl
+        import os
+        import tempfile
+        import time as _time
+        from pathlib import Path
+        from hermes.amp_client import request_deadline
+        from hermes.session_store import SessionStore, StoreLockError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.json"
+            store = SessionStore(path=path, lock_timeout=5.0)
+            fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            started = _time.monotonic()
+            try:
+                with request_deadline(_time.time() + 0.3), self.assertRaises(StoreLockError):
+                    store.get("s1")
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            self.assertLess(_time.monotonic() - started, 2.0)
+
+    def test_plan_non_dict_response_sets_marker_and_errors(self) -> None:
+        from test_plan_governance import _valid_plan
+
+        plugin = make_plugin()
+        plugin._client.get_hitl_decision = Mock(return_value=BASELINE)
+        plugin._client.request_plan_approval = Mock(return_value=["unexpected"])
+        with quiet(plugin), FakeClock().installed():
+            result = plugin.evaluate_proposed_plan("s1", _valid_plan())
+        self.assertEqual(result["status"], "error")
+        self.assertIsNotNone(plugin._get_marker("inst-1"))
+
+    def test_normalizer_crash_blocks_instead_of_raising(self) -> None:
+        plugin = make_plugin()
+        with patch.object(plugin_mod, "normalize_tool_call", side_effect=RecursionError("deep")):
+            result = _call(plugin, FakeClock(), "ls")
+        self.assertEqual(result["action"], "block")
+
+    def test_lock_unavailable_message_for_llm_and_plan_names_the_real_fix(self) -> None:
+        from test_enforcement import _make_exec_ctx
+
+        plugin = make_plugin(action_id_correlation=True)
+        with patch.object(plugin_mod, "_fcntl", None), patch.object(plugin, "_safe_log"), FakeClock().installed():
+            decision, reason = plugin._evaluate_llm_governance(_make_exec_ctx(), "m", "p", "", "s1",
+                                                               {"messages": []}, 1)
+        self.assertEqual(decision, "block")
+        self.assertIn("file lock", reason)
+        self.assertNotIn("AMP_ACTION_ID_CORRELATION", reason)
+
+    def test_defer_wording_on_llm_and_plan_paths(self) -> None:
+        from test_enforcement import _make_exec_ctx
+        from test_plan_governance import _valid_plan
+
+        plugin = make_plugin()
+        plugin._client.request_llm_hitl = Mock(return_value=pending("wi-1"))
+        plugin._client.get_hitl_decision = Mock(side_effect=[BASELINE, complete("defer", "wi-1")])
+        with patch.object(plugin, "_safe_log"), FakeClock().installed():
+            _, reason = plugin._evaluate_llm_governance(_make_exec_ctx(), "m", "p", "", "s1", {"messages": []}, 1)
+        self.assertIn("deferred", reason)
+        plugin = make_plugin()
+        plugin._client.request_plan_approval = Mock(return_value=pending("wi-2"))
+        plugin._client.get_hitl_decision = Mock(side_effect=[BASELINE, complete("defer", "wi-2")])
+        with quiet(plugin), FakeClock().installed():
+            result = plugin.evaluate_proposed_plan("s1", _valid_plan())
+        self.assertIn("deferred", result["reason"])
+
+    def test_finalize_survives_store_lock_error(self) -> None:
+        from hermes.session_store import StoreLockError
+
+        plugin = make_plugin()
+        plugin._store.get = Mock(side_effect=StoreLockError("busy"))
+        plugin.on_session_finalize(session_id="s1")  # must not raise
+        plugin.post_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1", status="ok")
+
+    def test_hard_deadline_refusal_is_not_a_pre_send_outage(self) -> None:
+        import time as _time
+        from hermes.amp_client import request_deadline
+
+        client = AmpClient(SimpleNamespace(backend_url="http://amp.invalid", api_key="k"))
+        with request_deadline(_time.time() - 1, hard=True), self.assertRaises(AmpClientError) as ctx:
+            client.get_hitl_decision("inst-1")
+        self.assertFalse(ctx.exception.pre_send)

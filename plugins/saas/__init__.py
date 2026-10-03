@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import dataclasses
 import uuid
 from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Set, Tuple
 
@@ -74,9 +75,19 @@ def _proven_outage(exc: BaseException) -> bool:
 
 def _request_may_have_landed(exc: BaseException) -> bool:
     """True when AMP may have accepted a request despite the error: transport failure /
-    5xx (no refusal code) or a 2xx with an unreadable body. Its workitem can appear late."""
+    5xx (no refusal code) or a 2xx with an unreadable body. Its workitem can appear late.
+    A proven pre-send outage (refused / DNS) never reached AMP."""
+    if getattr(exc, "pre_send", False):
+        return False
     code = getattr(exc, "status_code", None)
     return not isinstance(code, int) or code >= 500 or 200 <= code < 300
+
+
+def _decision_word(resolution: str) -> str:
+    """Wording for a non-approval that is not a reviewer rejection (bounded server text)."""
+    if resolution in {"defer", "deferred"}:
+        return "deferred"
+    return f"'{_truncate(resolution, 40)}'"
 
 
 def _call_fingerprint(action: NormalizedAction, args: Any) -> str:
@@ -589,6 +600,14 @@ class AmpGovernancePlugin:
     def _block_message(self, reason: str) -> Dict[str, str]:
         return {"action": "block", "message": reason}
 
+    def _safe_store_get(self, session_id: str) -> Optional[SessionRecord]:
+        """Store read for observer hooks: a StoreLockError must not escape a hook."""
+        try:
+            return self._store.get(session_id)
+        except Exception as exc:
+            logger.warning("amp-governance session store read failed: %s", exc)
+            return None
+
     def _safe_set_state(self, instance_id: str, state: str) -> None:
         try:
             with best_effort():
@@ -596,20 +615,22 @@ class AmpGovernancePlugin:
         except Exception as exc:
             logger.warning("amp-governance set_state(%s) failed: %s", state, exc)
 
-    def _ensure_ledger_seeded(self, instance_id: str) -> None:
-        """Load workitems an earlier process consumed/abandoned for this instance (K2.1)."""
+    def _ensure_ledger_seeded(self, instance_id: str) -> bool:
+        """Load workitems an earlier process consumed/abandoned for this instance (K2.1).
+        False when the store could not be read: the caller must not bind from a pending poll."""
         with self._instance_locks_guard:
             if instance_id in self._seeded_instances:
-                return
+                return True
         try:
             spent = self._store.spent_for_instance(instance_id)
         except Exception as exc:
             logger.warning("amp-governance: could not load consumed workitems: %s", exc)
-            return  # retried on the next call
+            return False  # retried on the next call
         for workitem_id in spent:
             self._ledger.mark_spent(instance_id, workitem_id)
         with self._instance_locks_guard:
             self._seeded_instances.add(instance_id)
+        return True
 
     def _record_spent(self, instance_id: str, workitem_id: str) -> None:
         """Never act on this workitem again, in this process or after a restart."""
@@ -682,10 +703,9 @@ class AmpGovernancePlugin:
             logger.warning("amp-governance: could not clear pending-review marker: %s", exc)
 
     def _get_marker(self, instance_id: str) -> Optional[Tuple[str, float]]:
-        try:
-            stored = self._store.get_unregistered(instance_id)
-        except Exception:
-            stored = None
+        """The late-workitem marker; raises if the session store cannot be read (callers
+        must then block: another process's marker could be hidden)."""
+        stored = self._store.get_unregistered(instance_id)
         if stored is not None:
             return stored
         return self._unregistered.get(instance_id)
@@ -700,7 +720,11 @@ class AmpGovernancePlugin:
         newest = ""
         if isinstance(baseline, dict):
             newest = str(baseline.get("workitem_id") or "").strip()
-        marker = self._get_marker(instance_id)
+        try:
+            marker = self._get_marker(instance_id)
+        except Exception as exc:
+            logger.warning("amp-governance: cannot read pending-review marker (%s); blocking", exc)
+            return _ReviewSlot(acquired=True, unregistered=True, baseline_workitem=newest, baselined=True)
         if marker is not None:
             marker_newest, noted_at = marker
             if time.time() - noted_at >= _UNREGISTERED_REVIEW_TTL_SECONDS:
@@ -732,7 +756,7 @@ class AmpGovernancePlugin:
         that keep other calls (threads and processes) on this instance from creating
         workitems meanwhile, identifies the workitem that is *not* ours.
         """
-        self._ensure_ledger_seeded(instance_id)
+        seeded = self._ensure_ledger_seeded(instance_id)
         file_lock, reason = self._acquire_review_locks(instance_id, deadline, require_file_lock=baseline)
         if file_lock is None:
             yield _ReviewSlot(acquired=False, lock_unavailable=reason == "unavailable")
@@ -740,6 +764,9 @@ class AmpGovernancePlugin:
         thread_lock = self._instance_lock(instance_id)
         try:
             slot = self._take_baseline(instance_id) if baseline else _ReviewSlot(acquired=True)
+            if not seeded:
+                # Consumed workitems of earlier processes unknown: bind only from the request.
+                slot = dataclasses.replace(slot, accept_unbound=False)
             yield slot
         finally:
             try:
@@ -748,12 +775,16 @@ class AmpGovernancePlugin:
                 thread_lock.release()
 
     @staticmethod
-    def _slot_refused_message(slot: _ReviewSlot, subject: str) -> str:
+    def _slot_refused_message(slot: _ReviewSlot, subject: str, *, scoped_possible: bool = True) -> str:
         if slot.lock_unavailable:
+            fix = (
+                "Enable AMP_ACTION_ID_CORRELATION to review without it."
+                if scoped_possible
+                else "LLM and plan reviews need a POSIX file lock (Linux, macOS or WSL)."
+            )
             return (
                 f"AMP review lock unavailable (no cross-process file lock on this platform or "
-                f"filesystem); {subject} was blocked. Enable AMP_ACTION_ID_CORRELATION to review "
-                "without it."
+                f"filesystem); {subject} was blocked. {fix}"
             )
         return (
             f"Another governed call in this session is still waiting for AMP review; "
@@ -857,7 +888,7 @@ class AmpGovernancePlugin:
             if not slot.acquired:
                 exec_ctx.llm_blocked += 1
                 exec_ctx.status = "blocked"
-                return "block", self._slot_refused_message(slot, "the LLM call")
+                return "block", self._slot_refused_message(slot, "the LLM call", scoped_possible=False)
             if slot.unregistered:
                 exec_ctx.llm_blocked += 1
                 exec_ctx.status = "blocked"
@@ -1124,6 +1155,9 @@ class AmpGovernancePlugin:
                 level="WARN",
             )
             reason = "LLM execution timed out waiting for AMP HITL approval."
+        elif outcome.detail not in {"", "reject", "rejected"}:
+            reason = f"LLM call not approved: the AMP review was {_decision_word(outcome.detail)}; blocked." + suffix
+            self._notify_user(reason)
         else:  # REJECTED and anything unrecognised
             self._notify_user("AMP reviewer rejected LLM execution." + suffix)
             self._safe_log(
@@ -1518,8 +1552,10 @@ class AmpGovernancePlugin:
         # REJECTED and anything unrecognised
         if outcome.detail not in {"", "reject", "rejected"}:
             # e.g. "defer": not a reviewer rejection (F7).
-            word = "deferred" if outcome.detail in {"defer", "deferred"} else f"'{outcome.detail}'"
-            message = f"{tool} was not approved: the AMP review was {word}, not approved; blocked." + suffix
+            message = (
+                f"{tool} was not approved: the AMP review was {_decision_word(outcome.detail)}, "
+                "not approved; blocked." + suffix
+            )
             self._notify_user(message)
             return self._block_message(message)
         self._notify_user(f'AMP reviewer rejected "{tool}".' + suffix)
@@ -1614,7 +1650,7 @@ class AmpGovernancePlugin:
         with self._review_slot(instance_id, deadline=budget.deadline) as slot:
             if not slot.acquired:
                 return self._plan_result(
-                    "error", plan_id=plan_id, reason=self._slot_refused_message(slot, "the plan"),
+                    "error", plan_id=plan_id, reason=self._slot_refused_message(slot, "the plan", scoped_possible=False),
                 )
             if slot.unregistered:
                 return self._plan_result("error", plan_id=plan_id, reason=self._unregistered_message("the plan"))
@@ -1658,6 +1694,11 @@ class AmpGovernancePlugin:
                 self._safe_log(instance_id, f"AMP unavailable for plan approval: {exc}", level="ERROR")
                 return self._plan_result("error", plan_id=plan_id, reason=f"AMP governance unavailable: {exc}")
 
+            if not isinstance(response, dict):
+                self._note_unregistered(instance_id, slot)  # the request may have created a workitem
+                return self._plan_result(
+                    "error", plan_id=plan_id, reason="AMP returned an unreadable plan approval response.",
+                )
             status = str(response.get("status") or "").strip().lower()
             reason = str(response.get("reason") or response.get("information") or "").strip()
 
@@ -1774,7 +1815,11 @@ class AmpGovernancePlugin:
         elif outcome.kind == hitl_poll.CANCELLED:
             reason = "The AMP review of the plan was cancelled before a reviewer decided; plan not approved."
         else:
-            reason = note or "Execution plan rejected by AMP HITL review."
+            reason = note or (
+                f"Execution plan not approved: the AMP review was {_decision_word(outcome.detail)}."
+                if outcome.detail not in {"", "reject", "rejected"}
+                else "Execution plan rejected by AMP HITL review."
+            )
         self._notify_user("AMP did not approve the execution plan. " + reason)
         self._safe_log(
             instance_id,
@@ -1831,7 +1876,7 @@ class AmpGovernancePlugin:
             exec_ctx = self._exec_contexts.remove(session_id)
             if exec_ctx is not None:
                 exec_ctx.status = "finished"
-                record = self._store.get(session_id)
+                record = self._safe_store_get(session_id)
                 instance_id = record.instance_id if record else exec_ctx.instance_id
                 try:
                     self._client.log_execution_summary(instance_id, exec_ctx.to_summary_dict())
@@ -1840,7 +1885,7 @@ class AmpGovernancePlugin:
 
         with self._open_sessions_lock:
             self._open_sessions.discard(session_id)
-        record = self._store.get(session_id)
+        record = self._safe_store_get(session_id)
         if not record:
             return
         self._ledger.forget_instance(record.instance_id)
@@ -1850,7 +1895,10 @@ class AmpGovernancePlugin:
         except Exception as exc:
             logger.warning("amp-governance finalize failed: %s", exc)
         finally:
-            self._store.delete(session_id)
+            try:
+                self._store.delete(session_id)
+            except Exception as exc:  # e.g. StoreLockError: never raise out of a hook
+                logger.warning("amp-governance session record delete failed: %s", exc)
 
     def on_session_end(self, session_id: str = "", **_: Any) -> None:
         """Finalize the AMP session at the end of a single-query run (A16b).
@@ -1961,7 +2009,12 @@ class AmpGovernancePlugin:
         **_: Any,
     ) -> Optional[Dict[str, str]]:
         started_at = time.time()
-        action = normalize_tool_call(tool_name, args)
+        try:
+            action = normalize_tool_call(tool_name, args)
+        except Exception as exc:
+            # Hermes treats a hook exception as "no decision" (allow): never let one escape.
+            logger.warning("amp-governance could not inspect %s: %s", tool_name, exc)
+            return self._block_message(f'AMP governance could not inspect the "{tool_name}" call; blocked.')
         if action is None:
             return None
         if not self._config.is_configured:
@@ -2030,7 +2083,7 @@ class AmpGovernancePlugin:
             exec_ctx = self._exec_contexts.get(session_id)
             if exec_ctx is not None:
                 exec_ctx.tool_calls += 1
-        record = self._store.get(session_id)
+        record = self._safe_store_get(session_id)
         if not record:
             return
         summary = f"Tool result | raw_tool={tool_name} | normalized={action.tool}/{action.action} | status={status or 'unknown'}"

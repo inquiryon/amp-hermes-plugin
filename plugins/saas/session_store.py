@@ -35,6 +35,15 @@ _KEY_DIGEST_RE = re.compile(r"^[0-9a-f]{%d}$" % _KEY_DIGEST_CHARS)
 # How long a store operation waits for another Hermes process holding sessions.json.
 _STORE_LOCK_TIMEOUT_SECONDS = 5.0
 _STORE_LOCK_POLL_SECONDS = 0.02
+_STORE_LOCK_GRACE_SECONDS = 1.0
+
+
+def _governance_deadline() -> Optional[float]:
+    try:
+        from .amp_client import current_deadline
+    except ImportError:  # imported standalone (tests of this module alone)
+        return None
+    return current_deadline()
 
 
 class StoreLockError(OSError):
@@ -144,7 +153,12 @@ class SessionStore:
         another Hermes process cannot interleave a load/save and drop consumed workitems
         or review markers. Raises StoreLockError when the lock is not obtained in time."""
         deadline = time.time() + self._lock_timeout
-        if not self._thread_lock.acquire(timeout=max(self._lock_timeout, 0.0)):
+        governance_deadline = _governance_deadline()
+        if governance_deadline is not None:
+            # Never outlast the hook's window; a short grace still lets the marker/spent
+            # write that follows a timed-out review land inside the safety margin.
+            deadline = min(deadline, governance_deadline + _STORE_LOCK_GRACE_SECONDS)
+        if not self._thread_lock.acquire(timeout=max(deadline - time.time(), 0.0)):
             raise StoreLockError("session store busy (thread lock)")
         fd = None
         try:
