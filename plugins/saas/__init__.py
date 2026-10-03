@@ -2022,7 +2022,12 @@ class AmpGovernancePlugin:
     ) -> Optional[Dict[str, str]]:
         started_at = time.time()
         try:
-            action = normalize_tool_call(tool_name, args)
+            action = normalize_tool_call(
+                tool_name,
+                args,
+                include_content_preview=getattr(self._config, "send_content_preview", False),
+                govern_unlisted=getattr(self._config, "govern_unlisted_tools", False),
+            )
         except Exception as exc:
             # Hermes treats a hook exception as "no decision" (allow): never let one escape.
             logger.warning("amp-governance could not inspect %s: %s", tool_name, exc)
@@ -2086,7 +2091,9 @@ class AmpGovernancePlugin:
         **_: Any,
     ) -> None:
         try:
-            action = normalize_tool_call(tool_name, args)
+            action = normalize_tool_call(
+                tool_name, args, govern_unlisted=getattr(self._config, "govern_unlisted_tools", False)
+            )
         except Exception as exc:  # an observer hook must never raise into Hermes
             logger.warning("amp-governance could not inspect %s result: %s", tool_name, exc)
             return
