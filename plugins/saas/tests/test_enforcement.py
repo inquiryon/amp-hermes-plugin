@@ -30,8 +30,34 @@ if str(ROOT_PARENT) not in sys.path:
 if HERMES_AGENT_ROOT.exists() and str(HERMES_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(HERMES_AGENT_ROOT))
 
+import hermes as _plugin_mod
 from hermes import AmpGovernancePlugin, _estimate_pending_call_cost, _worst_cost_status
 from hermes.execution_context import ExecutionContext, ExecutionContextStore
+
+
+# Released Hermes (v2026.8/v2026.9) does not ship hermes_cli.middleware.LLMExecutionBlocked
+# (upstream PR nousresearch/hermes-agent#64662 is unmerged). Use the real class when present,
+# otherwise a stand-in with the same constructor/attributes so the enforcement logic still runs.
+try:
+    from hermes_cli.middleware import LLMExecutionBlocked as _LEB
+    _REAL_LEB_AVAILABLE = True
+except ImportError:
+    _REAL_LEB_AVAILABLE = False
+
+    class _LEB(Exception):  # type: ignore[no-redef]
+        def __init__(self, reason, metadata=None):
+            super().__init__(reason)
+            self.reason = reason
+            self.metadata = metadata or {}
+
+
+def _use_llm_blocked(test: unittest.TestCase):
+    """Patch the plugin module so enforcement raises _LEB for the duration of `test`."""
+    for name, value in (("_LLMExecutionBlocked", _LEB), ("_LLM_BLOCKED_AVAILABLE", True)):
+        patcher = patch.object(_plugin_mod, name, value)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+    return _LEB
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +123,7 @@ def _decision(resolution="approved", info=""):
 # ---------------------------------------------------------------------------
 
 class CapabilityDetectionTests(unittest.TestCase):
+    @unittest.skipUnless(_REAL_LEB_AVAILABLE, "needs hermes-agent#64662 (LLMExecutionBlocked)")
     def test_blocked_available_import_succeeds(self):
         """When Hermes has LLMExecutionBlocked, the flag is True."""
         import importlib
@@ -132,6 +159,7 @@ class CapabilityDetectionTests(unittest.TestCase):
             register_middleware=Mock(),
             register_tool=Mock(),
             register_skill=Mock(),
+            register_cli_command=Mock(),
         )
 
         with patch.object(mod, "_LLM_BLOCKED_AVAILABLE", False), \
@@ -246,8 +274,7 @@ class ConfigurationGatingTests(unittest.TestCase):
 
 class PolicyOutcomeTests(unittest.TestCase):
     def setUp(self):
-        from hermes_cli.middleware import LLMExecutionBlocked
-        self.LEB = LLMExecutionBlocked
+        self.LEB = _use_llm_blocked(self)
 
     def _run_middleware(self, plugin, amp_response, decision_response=None):
         """Helper: run llm_execution_middleware with mocked AMP responses."""
@@ -420,8 +447,7 @@ class PolicyOutcomeTests(unittest.TestCase):
 
 class ProviderCallBehaviorTests(unittest.TestCase):
     def setUp(self):
-        from hermes_cli.middleware import LLMExecutionBlocked
-        self.LEB = LLMExecutionBlocked
+        self.LEB = _use_llm_blocked(self)
 
     def test_allow_calls_provider_exactly_once(self):
         plugin = _make_plugin()
@@ -555,8 +581,7 @@ class ProviderCallBehaviorTests(unittest.TestCase):
 
 class MultiTurnContextTests(unittest.TestCase):
     def setUp(self):
-        from hermes_cli.middleware import LLMExecutionBlocked
-        self.LEB = LLMExecutionBlocked
+        self.LEB = _use_llm_blocked(self)
 
     def test_three_allowed_calls_accumulate_correctly(self):
         plugin = _make_plugin(llm_enabled=True, mode="observe")
@@ -736,8 +761,7 @@ class MultiTurnContextTests(unittest.TestCase):
 
 class HitlNotificationTests(unittest.TestCase):
     def setUp(self):
-        from hermes_cli.middleware import LLMExecutionBlocked
-        self.LEB = LLMExecutionBlocked
+        self.LEB = _use_llm_blocked(self)
 
     def _run_hitl(self, plugin, decision_resolution):
         exec_ctx = _make_exec_ctx(total_cost_usd=1.0, cost_status="estimated")
@@ -1006,7 +1030,7 @@ class ExecutionContextEnforcementFieldsTests(unittest.TestCase):
         plugin._client.request_llm_hitl = Mock(return_value=_block_response())
         plugin._notify_user = Mock()
 
-        from hermes_cli.middleware import LLMExecutionBlocked
+        LLMExecutionBlocked = _use_llm_blocked(self)
         with patch.object(plugin, "_safe_log"):
             with self.assertRaises(LLMExecutionBlocked):
                 plugin.llm_execution_middleware(
