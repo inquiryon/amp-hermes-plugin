@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 import hashlib
@@ -10,7 +11,13 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+try:  # cross-process lock for read-modify-write of sessions.json (POSIX)
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None  # type: ignore[assignment]
 
 from hermes_constants import get_hermes_home
 
@@ -117,7 +124,31 @@ _RECORD_FIELDS = frozenset(field.name for field in fields(SessionRecord))
 class SessionStore:
     def __init__(self, path: Optional[Path] = None) -> None:
         self._path = path or _state_path()
-        self._lock = threading.Lock()
+        self._thread_lock = threading.Lock()
+
+    @contextmanager
+    def _lock_ctx(self) -> Iterator[None]:
+        """Thread lock plus a flock on sessions.json.lock, so another Hermes process
+        cannot interleave a load/save and drop consumed workitems or review markers."""
+        with self._thread_lock:
+            fd = None
+            if _fcntl is not None:
+                try:
+                    fd = os.open(f"{self._path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+                    _fcntl.flock(fd, _fcntl.LOCK_EX)
+                except OSError as exc:
+                    logger.warning("amp-governance: session store lock unavailable: %s", exc)
+                    if fd is not None:
+                        os.close(fd)
+                    fd = None
+            try:
+                yield
+            finally:
+                if fd is not None:
+                    try:
+                        _fcntl.flock(fd, _fcntl.LOCK_UN)
+                    finally:
+                        os.close(fd)
 
     def _load_all(self) -> Tuple[Dict[str, SessionRecord], bool]:
         """Return (records, needs_rewrite). needs_rewrite is True when a record
@@ -174,11 +205,11 @@ class SessionStore:
         return data
 
     def get(self, session_id: str) -> Optional[SessionRecord]:
-        with self._lock:
+        with self._lock_ctx():
             return self._load_clean().get(session_id)
 
     def put(self, record: SessionRecord) -> None:
-        with self._lock:
+        with self._lock_ctx():
             data, _ = self._load_all()
             record.last_seen_at = _utc_now()
             if not record.created_at:
@@ -190,7 +221,7 @@ class SessionStore:
         """Record a consumed/abandoned workitem on every record of ``instance_id`` (bounded)."""
         if not instance_id or not workitem_id:
             return
-        with self._lock:
+        with self._lock_ctx():
             data, dirty = self._load_all()
             for record in data.values():
                 if record.instance_id != instance_id:
@@ -210,17 +241,17 @@ class SessionStore:
         self._update_instance(instance_id, "", "")
 
     def get_unregistered(self, instance_id: str) -> Optional[Tuple[str, float]]:
-        with self._lock:
+        with self._lock_ctx():
             for record in self._load_clean().values():
                 if record.instance_id == instance_id and record.unregistered_since:
                     try:
                         return record.unregistered_after, float(record.unregistered_since)
                     except ValueError:
-                        return record.unregistered_after, 0.0
+                        return record.unregistered_after, time.time()  # unreadable: fail closed
         return None
 
     def _update_instance(self, instance_id: str, newest: str, since: str) -> bool:
-        with self._lock:
+        with self._lock_ctx():
             data, dirty = self._load_all()
             found = False
             for record in data.values():
@@ -234,7 +265,7 @@ class SessionStore:
             return found
 
     def spent_for_instance(self, instance_id: str) -> List[str]:
-        with self._lock:
+        with self._lock_ctx():
             ids: List[str] = []
             for record in self._load_clean().values():
                 if record.instance_id == instance_id:
@@ -242,7 +273,7 @@ class SessionStore:
             return ids
 
     def delete(self, session_id: str) -> None:
-        with self._lock:
+        with self._lock_ctx():
             data, dirty = self._load_all()
             if session_id in data:
                 del data[session_id]

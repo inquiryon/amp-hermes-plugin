@@ -58,7 +58,8 @@ class SessionStoreSchemaTests(_TempStore):
     def test_save_leaves_no_temp_file(self) -> None:
         store = SessionStore(path=self.path)
         store.put(SessionRecord("s1", "i1"))
-        self.assertEqual([p.name for p in self.path.parent.iterdir()], ["sessions.json"])
+        # sessions.json.lock is the intentional cross-process lock file; no *.tmp may remain
+        self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()), ["sessions.json", "sessions.json.lock"])
 
     @unittest.skipIf(os.name == "nt", "POSIX modes only")
     def test_file_is_private_where_the_filesystem_supports_it(self) -> None:

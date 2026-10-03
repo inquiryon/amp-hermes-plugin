@@ -522,3 +522,61 @@ class K21SecondReviewTests(unittest.TestCase):
                 with plugin._review_slot("inst-1", deadline=time.time() + 5):
                     pass
         self.assertTrue(plugin._instance_lock("inst-1").acquire(blocking=False))
+
+
+class K21ThirdReviewTests(unittest.TestCase):
+    """Round-3 security findings M1 (2xx non-JSON) and M2 (cross-process store writes)."""
+
+    def test_non_json_2xx_request_sets_marker(self) -> None:
+        clock = FakeClock()
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})
+        plugin._client.request_hitl = Mock(side_effect=AmpClientError("non-JSON", status_code=200, body="<html>"))
+        with quiet(plugin), clock.installed():
+            first = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+            self.assertEqual(first["action"], "block")
+            plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+            second = plugin.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /"}, session_id="s1")
+        self.assertIn("not been registered", second["message"])
+
+    def test_non_dict_request_response_sets_marker(self) -> None:
+        clock = FakeClock()
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})
+        plugin._client.request_hitl = Mock(return_value=["accepted"])
+        with quiet(plugin), clock.installed():
+            plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+            plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+            second = plugin.pre_tool_call(tool_name="terminal", args={"command": "pwd"}, session_id="s1")
+        self.assertIn("not been registered", second["message"])
+
+    def test_store_writes_wait_for_the_cross_process_lock(self) -> None:
+        import fcntl
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.json"
+            store = SessionStore(path=path)
+            store.put(SessionRecord("s1", "inst-1"))
+            fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            done = threading.Event()
+            worker = threading.Thread(target=lambda: (store.remember_spent("inst-1", "wi-9"), done.set()))
+            worker.start()
+            try:
+                self.assertFalse(done.wait(0.3))  # blocked by the other "process"
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            worker.join(5)
+            self.assertTrue(done.is_set())
+            self.assertIn("wi-9", store.spent_for_instance("inst-1"))
+
+    def test_malformed_marker_time_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.json"
+            path.write_text(json.dumps({"s1": {"session_id": "s1", "instance_id": "inst-1",
+                                               "unregistered_after": "W0", "unregistered_since": "garbage"}}))
+            marker = SessionStore(path=path).get_unregistered("inst-1")
+        self.assertEqual(marker[0], "W0")
+        self.assertGreater(marker[1], time.time() - 5)

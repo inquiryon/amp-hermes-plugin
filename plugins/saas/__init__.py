@@ -66,6 +66,13 @@ def _http_client_error_code(exc: BaseException) -> Optional[int]:
     return None
 
 
+def _request_may_have_landed(exc: BaseException) -> bool:
+    """True when AMP may have accepted a request despite the error: transport failure /
+    5xx (no refusal code) or a 2xx with an unreadable body. Its workitem can appear late."""
+    code = getattr(exc, "status_code", None)
+    return not isinstance(code, int) or code >= 500 or 200 <= code < 300
+
+
 def _call_fingerprint(action: NormalizedAction, args: Any) -> str:
     """Identify one exact governed call (tool, action, full args) without storing the args."""
     try:
@@ -889,6 +896,8 @@ class AmpGovernancePlugin:
                 llm_calls_total=exec_ctx.llm_calls,
             )
         except Exception as exc:
+            if _request_may_have_landed(exc):
+                self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
             rejected_code = _http_client_error_code(exc)
             if rejected_code is not None:
                 # AMP answered and refused (bad key, org, call limit, payload): never an
@@ -901,7 +910,6 @@ class AmpGovernancePlugin:
                 exec_ctx.llm_blocked += 1
                 exec_ctx.status = "blocked"
                 return "block", message
-            self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
             self._safe_log(
                 instance_id,
                 f"AMP unavailable for LLM policy check: {exc}",
@@ -923,6 +931,7 @@ class AmpGovernancePlugin:
             return "allow", ""
 
         if not isinstance(response, dict):
+            self._note_unregistered(instance_id, slot)  # the request may have created a workitem
             response = {}  # falls through to the unexpected-status block below
         status = str(response.get("status") or "").strip().lower()
         reason = str(response.get("reason") or response.get("information") or "").strip()
@@ -1214,6 +1223,8 @@ class AmpGovernancePlugin:
             else:
                 response = self._client.request_hitl(instance_id, action)
         except Exception as exc:
+            if _request_may_have_landed(exc):
+                self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
             rejected_code = _http_client_error_code(exc)
             if rejected_code is not None:
                 # AMP answered and refused (bad key, org, call limit, payload). That is a
@@ -1230,12 +1241,12 @@ class AmpGovernancePlugin:
                 f"Error: {_truncate(str(exc), 200)}"
             )
             self._safe_log(instance_id, message, level="ERROR")
-            self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
             if self._config.fail_closed or time.time() >= budget.deadline:
                 return self._block_message(message)
             return None
 
         if not isinstance(response, dict):
+            self._note_unregistered(instance_id, slot)  # the request may have created a workitem
             message = f"AMP returned an unreadable governance response for {action.raw_tool_name}; blocked."
             self._safe_log(instance_id, message, level="ERROR")
             return self._block_message(message)
@@ -1564,7 +1575,7 @@ class AmpGovernancePlugin:
                     payload=payload,
                 )
             except Exception as exc:
-                if _http_client_error_code(exc) is None:
+                if _request_may_have_landed(exc):
                     self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
                 self._safe_log(instance_id, f"AMP unavailable for plan approval: {exc}", level="ERROR")
                 return self._plan_result("error", plan_id=plan_id, reason=f"AMP governance unavailable: {exc}")
