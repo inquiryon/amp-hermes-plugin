@@ -43,7 +43,7 @@ if "hermes" not in sys.modules:
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_amp(monkeypatch):
+def _hermetic_amp(monkeypatch, tmp_path):
     """Default every test to: no Hermes host time limits, no real network.
 
     Tests that exercise host limits or HTTP patch these names themselves
@@ -59,3 +59,6 @@ def _hermetic_amp(monkeypatch):
 
     monkeypatch.setattr(sys.modules["hermes.amp_client"], "urlopen", _no_network)
     monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    # Fresh plugin state per test: sessions.json now persists consumed workitems and
+    # pending-review markers, which must not leak between tests.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))

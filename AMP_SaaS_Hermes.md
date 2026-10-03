@@ -303,7 +303,7 @@ Even then, `600 s` minus the margin is the ceiling, so reviewers have about **9.
 - remembers the last 50 consumed or abandoned workitems per instance in `sessions.json`, so a restarted Hermes that reuses the AMP instance cannot act on an old approval.
 
 - only accepts a decision for a workitem it is bound to (from the request response or a *pending* poll). A decision AMP cannot tie to a workitem (`method` `auto`/`fallback`) blocks at once as an "unverifiable decision";
-- when a request's workitem never appeared before the call gave up, blocks the next call on that instance for up to 5 minutes ("has not been registered yet"), so the late workitem cannot decide a different call;
+- when a request's workitem never appeared before the call gave up, blocks the next call on that instance for up to 5 minutes ("has not been registered yet"), so the late workitem cannot decide a different call. This also applies after a failed request on the LLM and plan paths and with `AMP_ACTION_ID_CORRELATION=true`. The marker is kept in `sessions.json`, so a new Hermes process sees it too. One network error can therefore pause governed calls on that session for up to 5 minutes;
 - also locks across Hermes processes on the same session (a file lock under `plugin_state/amp-governance/locks/`, POSIX only).
 
 If the baseline poll fails, a 4xx blocks the call. A network error follows `AMP_FAIL_CLOSED`; even with fail-open, the call is then decided only by a workitem the plugin saw pending. With `AMP_ACTION_ID_CORRELATION=true`, AMP matches by `action_id`, and the lock and baseline are skipped.

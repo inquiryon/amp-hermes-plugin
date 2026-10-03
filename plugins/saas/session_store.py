@@ -88,6 +88,10 @@ class SessionRecord:
     agent_fingerprint: str = ""
     # Newest last, at most SPENT_WORKITEMS_LIMIT entries.
     spent_workitem_ids: List[str] = field(default_factory=list)
+    # Late-workitem marker (K2.1): newest workitem seen when a request went out whose own
+    # workitem never appeared ("?" = unknown), and when (epoch seconds, as text).
+    unregistered_after: str = ""
+    unregistered_since: str = ""
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> Optional["SessionRecord"]:
@@ -197,6 +201,37 @@ class SessionStore:
                 dirty = True
             if dirty:
                 self._save_all(data)
+
+    def set_unregistered(self, instance_id: str, newest: str, since: float) -> bool:
+        """Persist the late-workitem marker on every record of the instance; False if none."""
+        return self._update_instance(instance_id, newest, f"{since:.3f}")
+
+    def clear_unregistered(self, instance_id: str) -> None:
+        self._update_instance(instance_id, "", "")
+
+    def get_unregistered(self, instance_id: str) -> Optional[Tuple[str, float]]:
+        with self._lock:
+            for record in self._load_clean().values():
+                if record.instance_id == instance_id and record.unregistered_since:
+                    try:
+                        return record.unregistered_after, float(record.unregistered_since)
+                    except ValueError:
+                        return record.unregistered_after, 0.0
+        return None
+
+    def _update_instance(self, instance_id: str, newest: str, since: str) -> bool:
+        with self._lock:
+            data, dirty = self._load_all()
+            found = False
+            for record in data.values():
+                if record.instance_id == instance_id:
+                    found = True
+                    if (record.unregistered_after, record.unregistered_since) != (newest, since):
+                        record.unregistered_after, record.unregistered_since = newest, since
+                        dirty = True
+            if dirty:
+                self._save_all(data)
+            return found
 
     def spent_for_instance(self, instance_id: str) -> List[str]:
         with self._lock:

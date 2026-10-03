@@ -91,6 +91,8 @@ except ImportError:  # pragma: no cover - Windows
 _UNREGISTERED_REVIEW_TTL_SECONDS = 300.0
 # Slot-lock polling step while another call (thread or process) holds the review.
 _SLOT_POLL_SECONDS = 0.05
+# Marker value when the newest workitem at the unregistered call's baseline is unknown.
+_UNKNOWN_NEWEST = "?"
 
 
 class _InstanceFileLock:
@@ -620,9 +622,36 @@ class AmpGovernancePlugin:
             time.sleep(_SLOT_POLL_SECONDS)
 
     def _note_unregistered(self, instance_id: str, slot: _ReviewSlot) -> None:
-        """A request went out but its workitem was never seen (K2.1 late workitem)."""
-        if slot.baselined or not slot.accept_unbound:
-            self._unregistered[instance_id] = (slot.baseline_workitem, time.time())
+        """A request went out but its workitem was never seen (K2.1 late workitem).
+
+        Kept in memory and in the session store (read under the cross-process lock), so
+        the next call -- in this process or another one -- cannot bind the late workitem.
+        """
+        newest = slot.baseline_workitem if slot.baselined else _UNKNOWN_NEWEST
+        self._set_marker(instance_id, newest, time.time())
+
+    def _set_marker(self, instance_id: str, newest: str, since: float) -> None:
+        self._unregistered[instance_id] = (newest, since)
+        try:
+            self._store.set_unregistered(instance_id, newest, since)
+        except Exception as exc:
+            logger.warning("amp-governance: could not persist pending-review marker: %s", exc)
+
+    def _clear_marker(self, instance_id: str) -> None:
+        self._unregistered.pop(instance_id, None)
+        try:
+            self._store.clear_unregistered(instance_id)
+        except Exception as exc:
+            logger.warning("amp-governance: could not clear pending-review marker: %s", exc)
+
+    def _get_marker(self, instance_id: str) -> Optional[Tuple[str, float]]:
+        try:
+            stored = self._store.get_unregistered(instance_id)
+        except Exception:
+            stored = None
+        if stored is not None:
+            return stored
+        return self._unregistered.get(instance_id)
 
     def _take_baseline(self, instance_id: str) -> _ReviewSlot:
         try:
@@ -634,13 +663,20 @@ class AmpGovernancePlugin:
         newest = ""
         if isinstance(baseline, dict):
             newest = str(baseline.get("workitem_id") or "").strip()
-        marker = self._unregistered.get(instance_id)
+        marker = self._get_marker(instance_id)
         if marker is not None:
             marker_newest, noted_at = marker
-            if newest == marker_newest and time.time() - noted_at < _UNREGISTERED_REVIEW_TTL_SECONDS:
+            if time.time() - noted_at >= _UNREGISTERED_REVIEW_TTL_SECONDS:
+                self._clear_marker(instance_id)
+            elif marker_newest == _UNKNOWN_NEWEST:
+                # We never knew what was newest before that request: learn it now and keep
+                # blocking until it changes (the late workitem) or the TTL ends.
+                self._set_marker(instance_id, newest, noted_at)
                 return _ReviewSlot(acquired=True, unregistered=True, baseline_workitem=newest, baselined=True)
-            self._unregistered.pop(instance_id, None)
-            if newest != marker_newest:
+            elif newest == marker_newest:
+                return _ReviewSlot(acquired=True, unregistered=True, baseline_workitem=newest, baselined=True)
+            else:
+                self._clear_marker(instance_id)
                 self._record_spent(instance_id, newest)  # most likely the late workitem
         return _ReviewSlot(
             acquired=True,
@@ -664,12 +700,15 @@ class AmpGovernancePlugin:
         if file_lock is None:
             yield _ReviewSlot(acquired=False)
             return
+        thread_lock = self._instance_lock(instance_id)
         try:
             slot = self._take_baseline(instance_id) if baseline else _ReviewSlot(acquired=True)
             yield slot
         finally:
-            file_lock.release()
-            self._instance_lock(instance_id).release()
+            try:
+                file_lock.release()
+            finally:
+                thread_lock.release()
 
     def _unregistered_message(self, subject: str) -> str:
         return (
@@ -862,6 +901,7 @@ class AmpGovernancePlugin:
                 exec_ctx.llm_blocked += 1
                 exec_ctx.status = "blocked"
                 return "block", message
+            self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
             self._safe_log(
                 instance_id,
                 f"AMP unavailable for LLM policy check: {exc}",
@@ -1190,8 +1230,7 @@ class AmpGovernancePlugin:
                 f"Error: {_truncate(str(exc), 200)}"
             )
             self._safe_log(instance_id, message, level="ERROR")
-            if not action_id:
-                self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
+            self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
             if self._config.fail_closed or time.time() >= budget.deadline:
                 return self._block_message(message)
             return None
@@ -1282,7 +1321,8 @@ class AmpGovernancePlugin:
         bound = outcome.workitem_id
         # Consumed or abandoned: no later call may act on this workitem's decision ...
         self._record_spent(instance_id, bound)
-        if not bound and not action_id and outcome.kind not in hitl_poll.TERMINAL_KINDS:
+        if not bound and outcome.kind not in hitl_poll.TERMINAL_KINDS:
+            # Even with action_id, a late workitem could be bound by an unscoped LLM/plan poll.
             self._note_unregistered(instance_id, slot)
         if outcome.kind not in hitl_poll.TERMINAL_KINDS:
             # ... except an identical retry, which waits on the still-open review (A19).
@@ -1524,6 +1564,8 @@ class AmpGovernancePlugin:
                     payload=payload,
                 )
             except Exception as exc:
+                if _http_client_error_code(exc) is None:
+                    self._note_unregistered(instance_id, slot)  # AMP may have accepted it anyway
                 self._safe_log(instance_id, f"AMP unavailable for plan approval: {exc}", level="ERROR")
                 return self._plan_result("error", plan_id=plan_id, reason=f"AMP governance unavailable: {exc}")
 
