@@ -17,7 +17,7 @@ from .execution_context import ExecutionContext, ExecutionContextStore, LlmCallR
 from .notification import notify_user
 from .policy import NormalizedAction, normalize_tool_call
 from .research_config import load_research_topics
-from .session_store import SessionRecord, SessionStore
+from .session_store import SessionRecord, SessionStore, agent_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -383,12 +383,12 @@ class AmpGovernancePlugin:
         )
 
     def _config_fingerprint(self) -> str:
-        return "|".join([
+        return agent_fingerprint(
             self._config.backend_url,
             self._config.org_id,
             self._config.agent_name,
             self._config.api_key,
-        ])
+        )
 
     def _ensure_instance(
         self,

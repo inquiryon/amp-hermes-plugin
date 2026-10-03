@@ -1,13 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
+import hashlib
 import json
+import logging
+import os
 from pathlib import Path
+import re
 import threading
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+
+logger = logging.getLogger(__name__)
+
+# Length of the API-key digest kept in a fingerprint. The fingerprint only has
+# to tell "same key" from "different key"; it must never hold the key itself.
+_KEY_DIGEST_CHARS = 16
+_KEY_DIGEST_RE = re.compile(r"^[0-9a-f]{%d}$" % _KEY_DIGEST_CHARS)
 
 
 def _utc_now() -> str:
@@ -25,6 +36,36 @@ def _state_path() -> Path:
     return state_dir / "sessions.json"
 
 
+def _key_digest(api_key: str) -> str:
+    if not api_key:
+        return ""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:_KEY_DIGEST_CHARS]
+
+
+def agent_fingerprint(backend_url: str, org_id: str, agent_name: str, api_key: str) -> str:
+    """Identify the AMP agent a cached instance belongs to without storing the key.
+
+    sessions.json lives under HERMES_HOME, which can be world-readable (e.g. an
+    NTFS mount under WSL), so only a short SHA-256 digest of the API key is kept.
+    """
+    return "|".join([backend_url, org_id, agent_name, _key_digest(api_key)])
+
+
+def _scrub_fingerprint(fingerprint: str) -> str:
+    """Rewrite a pre-0.5.3 fingerprint that ended in the raw API key.
+
+    The result equals ``agent_fingerprint`` for the same key, so a migrated
+    session keeps its AMP instance instead of being re-initialised.
+    """
+    parts = fingerprint.split("|")
+    if len(parts) < 4:
+        return fingerprint
+    key = "|".join(parts[3:])
+    if not key or _KEY_DIGEST_RE.match(key):
+        return fingerprint
+    return "|".join(parts[:3] + [_key_digest(key)])
+
+
 @dataclass
 class SessionRecord:
     session_id: str
@@ -33,18 +74,31 @@ class SessionRecord:
     platform: str = ""
     created_at: str = ""
     last_seen_at: str = ""
-    # Fingerprint of the AMP config (backend/org/agent/api key) active when
-    # this record was created. A cached instance_id is only safe to reuse if
-    # the plugin is still talking to the same AMP agent — without this, a
+    # Fingerprint of the AMP config (backend/org/agent/API-key digest) active
+    # when this record was created. A cached instance_id is only safe to reuse
+    # if the plugin is still talking to the same AMP agent — without this, a
     # Hermes session that outlives an .env change (e.g. re-pointing at a new
     # agent during QSJ setup) keeps reusing the old agent's instance_id and
     # never calls init_instance() again, so AMP never records a fresh
-    # connection for the new agent.
+    # connection for the new agent. See agent_fingerprint().
     agent_fingerprint: str = ""
 
     @classmethod
-    def from_dict(cls, payload: Dict[str, str]) -> "SessionRecord":
-        return cls(**payload)
+    def from_dict(cls, payload: Dict[str, Any]) -> Optional["SessionRecord"]:
+        """Build a record from stored JSON; None if it cannot be trusted.
+
+        Unknown keys (written by a newer plugin) are ignored; a record without
+        session_id/instance_id, or with values of the wrong type, is dropped.
+        """
+        known = {key: value for key, value in payload.items() if key in _RECORD_FIELDS}
+        if not known.get("session_id") or not known.get("instance_id"):
+            return None
+        if not all(isinstance(value, str) for value in known.values()):
+            return None
+        return cls(**known)
+
+
+_RECORD_FIELDS = frozenset(field.name for field in fields(SessionRecord))
 
 
 class SessionStore:
@@ -52,32 +106,60 @@ class SessionStore:
         self._path = path or _state_path()
         self._lock = threading.Lock()
 
-    def _load_all(self) -> Dict[str, SessionRecord]:
+    def _load_all(self) -> Tuple[Dict[str, SessionRecord], bool]:
+        """Return (records, needs_rewrite). needs_rewrite is True when a record
+        was dropped or migrated, so the caller persists the cleaned file."""
         if not self._path.exists():
-            return {}
+            return {}, False
         try:
             raw = json.loads(self._path.read_text())
-        except Exception:
-            return {}
+        except Exception as exc:
+            logger.warning("amp-governance: ignoring unreadable session store %s: %s", self._path, exc)
+            return {}, False
         if not isinstance(raw, dict):
-            return {}
+            return {}, False
         out: Dict[str, SessionRecord] = {}
+        dirty = False
         for session_id, payload in raw.items():
-            if isinstance(payload, dict):
-                out[session_id] = SessionRecord.from_dict(payload)
-        return out
+            record = SessionRecord.from_dict(payload) if isinstance(payload, dict) else None
+            if record is None:
+                logger.warning("amp-governance: dropping unreadable session record %r", session_id)
+                dirty = True
+                continue
+            scrubbed = _scrub_fingerprint(record.agent_fingerprint)
+            if scrubbed != record.agent_fingerprint:
+                record.agent_fingerprint = scrubbed
+                dirty = True
+            out[session_id] = record
+        return out, dirty
 
     def _save_all(self, data: Dict[str, SessionRecord]) -> None:
         serializable = {key: asdict(value) for key, value in data.items()}
-        self._path.write_text(json.dumps(serializable, indent=2) + "\n")
+        text = json.dumps(serializable, indent=2) + "\n"
+        tmp_path = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(text)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass  # e.g. NTFS under WSL ignores POSIX modes; the key digest is the real protection
+        os.replace(tmp_path, self._path)
+
+    def _load_clean(self) -> Dict[str, SessionRecord]:
+        data, dirty = self._load_all()
+        if dirty:
+            try:
+                self._save_all(data)
+            except OSError as exc:
+                logger.warning("amp-governance: could not rewrite session store: %s", exc)
+        return data
 
     def get(self, session_id: str) -> Optional[SessionRecord]:
         with self._lock:
-            return self._load_all().get(session_id)
+            return self._load_clean().get(session_id)
 
     def put(self, record: SessionRecord) -> None:
         with self._lock:
-            data = self._load_all()
+            data, _ = self._load_all()
             record.last_seen_at = _utc_now()
             if not record.created_at:
                 record.created_at = record.last_seen_at
@@ -86,7 +168,9 @@ class SessionStore:
 
     def delete(self, session_id: str) -> None:
         with self._lock:
-            data = self._load_all()
+            data, dirty = self._load_all()
             if session_id in data:
                 del data[session_id]
+                dirty = True
+            if dirty:
                 self._save_all(data)
