@@ -495,3 +495,38 @@ class Wave2cLowTests(unittest.TestCase):
         plugin = make_plugin()
         with patch.object(plugin_mod, "normalize_tool_call", side_effect=RecursionError("deep")):
             plugin.post_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1", status="ok")
+
+
+class CancelledUnboundTests(unittest.TestCase):
+    """Wave-3 S08c: id-less request (production shape), first poll pending + Cancelled."""
+
+    def test_S08c_cancelled_on_first_pending_poll_blocks_immediately(self) -> None:
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(side_effect=[
+            BASELINE, pending("wi-1", workitem_status="Cancelled"),
+        ])
+        result = _call(plugin, FakeClock(), "ls")
+        self.assertIn("cancelled", result["message"])
+        self.assertIn("not rejected by a reviewer", result["message"])
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+        self.assertTrue(plugin._ledger.is_spent("inst-1", "wi-1"))
+
+    def test_S08c_wid_cancelled_status_with_workitem_blocks_immediately(self) -> None:
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(side_effect=[
+            BASELINE, {"status": "cancelled", "workitem_id": "wi-1", "workitem_status": "Cancelled"},
+        ])
+        result = _call(plugin, FakeClock(), "ls")
+        self.assertIn("cancelled", result["message"])
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+
+    def test_foreign_cancelled_workitem_is_still_skipped(self) -> None:
+        plugin = make_plugin(hitl_timeout_minutes=1)
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        cancelled_old = pending("wi-old", workitem_status="Cancelled")
+        plugin._client.get_hitl_decision = Mock(side_effect=[
+            cancelled_old, cancelled_old, pending("wi-new"), complete("approve", "wi-new"),
+        ])
+        self.assertIsNone(_call(plugin, FakeClock(), "ls"))

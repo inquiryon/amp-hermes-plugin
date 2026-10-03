@@ -323,8 +323,9 @@ def _poll(
                                detail=resolution if kind == REJECTED else "")
 
         if status in _CANCELLED or _lower(decision.get("workitem_status")) in _CANCELLED:
-            if workitem_id and workitem_id != bound and action_id is None:
-                continue  # another call's cancelled workitem
+            # Foreign, spent and other calls' workitems were skipped above, so an unbound
+            # call's first non-foreign workitem is its own (K1, Wave-3 S08c). A cancelled
+            # outcome can only block, so taking it unbound never opens an allow.
             ledger.mark_spent(instance_id, workitem_id)
             information = str(decision.get("information") or "").strip()
             return PollOutcome(CANCELLED, workitem_id or bound, information=information, polls=polls)
