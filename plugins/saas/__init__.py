@@ -662,7 +662,8 @@ class AmpGovernancePlugin:
         if status in {"policy_error", "config_error", "error"}:
             exec_ctx.llm_blocked += 1
             exec_ctx.status = "blocked"
-            return "block", str(response.get("message") or reason or "AMP policy is misconfigured; LLM call blocked.")
+            server_message = _truncate(" ".join(str(response.get("message") or reason).split()), 300)
+            return "block", server_message or "AMP policy is misconfigured; LLM call blocked."
 
         if status in {"no-hitl", "allow", "allowed", "approved"}:
             exec_ctx.status = "running"
@@ -892,7 +893,10 @@ class AmpGovernancePlugin:
                 ).strip()
                 self._safe_log(instance_id, message, level="ERROR")
                 return self._block_message(message)
-            message = f"AMP governance is unavailable; blocked {action.raw_tool_name}. Error: {exc}"
+            message = (
+                f"AMP governance is unavailable; blocked {action.raw_tool_name}. "
+                f"Error: {_truncate(str(exc), 200)}"
+            )
             self._safe_log(instance_id, message, level="ERROR")
             if self._config.fail_closed or time.time() >= budget.deadline:
                 return self._block_message(message)
@@ -916,9 +920,10 @@ class AmpGovernancePlugin:
 
         if status in {"policy_error", "config_error", "error"}:
             # Prefer AMP's human-readable message; `reason` is a code such as
-            # policy_invalid_hitl_assignee.
+            # policy_invalid_hitl_assignee. Server text: one line, bounded.
             return self._block_message(
-                str(response.get("message") or "").strip() or reason or (
+                _truncate(" ".join(str(response.get("message") or "").split()), 300)
+                or _truncate(reason, 300) or (
                     f'AMP policy for agent "{self._config.agent_name}" is misconfigured; '
                     f'"{action.raw_tool_name}" was blocked.'
                 )
@@ -1493,9 +1498,12 @@ class AmpGovernancePlugin:
                 ).strip()
                 self._record_blocked_turn(session_id, message)
                 return self._block_message(message)
-            if self._config.fail_closed or time.time() >= budget.deadline:
+            # AMP_FAIL_CLOSED=false only covers AMP being unreachable. A local error
+            # (store, notification, bug) after or before AMP answered is never an allow.
+            is_outage = isinstance(exc, AmpClientError) and exc.status_code is None
+            if self._config.fail_closed or not is_outage or time.time() >= budget.deadline:
                 message = (
-                    f'AMP governance failed while checking "{tool_name}": {exc}'
+                    f'AMP governance failed while checking "{tool_name}": {_truncate(str(exc), 200)}'
                 )
                 self._record_blocked_turn(session_id, message)
                 return self._block_message(message)

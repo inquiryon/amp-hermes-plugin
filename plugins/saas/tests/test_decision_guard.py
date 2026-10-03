@@ -320,3 +320,73 @@ class ReviewFindingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SecurityReviewTests(unittest.TestCase):
+    """Gate-3 review findings M1-M4, L2, L4."""
+
+    def test_unavailable_message_truncates_server_body(self) -> None:
+        from hermes.amp_client import AmpClientError
+
+        plugin = make_plugin()
+        plugin._client.request_hitl = Mock(side_effect=AmpClientError("HTTP 502: " + "<html>" * 2000, status_code=502))
+        result = _governed(plugin)
+        self.assertLess(len(result["message"]), 400)
+
+    def test_policy_error_message_is_bounded_single_line(self) -> None:
+        plugin = make_plugin()
+        plugin._client.request_hitl = Mock(return_value={"status": "policy_error", "message": "bad\n" + "x" * 5000})
+        message = _governed(plugin)["message"]
+        self.assertNotIn("\n", message)
+        self.assertLess(len(message), 400)
+
+    def test_local_error_after_amp_answered_blocks_even_when_fail_open(self) -> None:
+        plugin = make_plugin(fail_closed=False)
+        plugin._client.request_hitl = Mock(return_value=pending("wi-1"))
+        plugin._notify_user = Mock(side_effect=RuntimeError("local bug"))
+        result = _governed(plugin)
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+
+    def test_local_store_error_blocks_even_when_fail_open(self) -> None:
+        plugin = make_plugin(fail_closed=False)
+        clock = FakeClock()
+        with patch.object(plugin, "_safe_log"), clock.installed(), patch.object(
+            plugin, "_ensure_instance", side_effect=OSError("disk full")
+        ):
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+
+    def test_client_error_body_is_capped(self) -> None:
+        from io import BytesIO
+        from types import SimpleNamespace
+        from urllib.error import HTTPError
+        from hermes.amp_client import AmpClient, AmpClientError
+
+        client = AmpClient(SimpleNamespace(backend_url="http://amp.invalid", api_key="k"))
+        error = HTTPError("http://amp.invalid/x", 502, "Bad", {}, BytesIO(b"y" * 10000))
+        with patch("hermes.amp_client.urlopen", side_effect=error):
+            with self.assertRaises(AmpClientError) as ctx:
+                client.get_hitl_decision("inst-1")
+        self.assertLessEqual(len(ctx.exception.body), 500)
+        self.assertLess(len(str(ctx.exception)), 600)
+
+    def test_redirects_are_refused_so_the_key_is_not_forwarded(self) -> None:
+        from hermes import amp_client
+
+        handler = amp_client._NoRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "http://evil.example/"))
+
+    def test_config_repr_hides_api_key(self) -> None:
+        from hermes.config import AmpConfig
+
+        cfg = AmpConfig("u", "amp_k_secret_value", "o", "a", "n", 10, 3, True, True, True, "observe", False, True)
+        self.assertNotIn("amp_k_secret_value", repr(cfg))
+
+    def test_session_store_temp_file_is_not_predictable(self) -> None:
+        import inspect
+        from hermes import session_store
+
+        source = inspect.getsource(session_store.SessionStore._save_all)
+        self.assertIn("mkstemp", source)

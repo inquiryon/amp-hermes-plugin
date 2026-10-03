@@ -7,13 +7,30 @@ import time
 from typing import Any, Dict, Iterator, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import AmpConfig
 from .policy import NormalizedAction
 
 
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 30.0
+# Server-controlled text kept from an error response (it reaches logs and model context).
+_ERROR_BODY_LIMIT = 500
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Refuse redirects: urllib would forward the X-API-Key header to the new host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
+_OPENER = build_opener(_NoRedirect())
+
+
+def urlopen(req: Request, timeout: float) -> Any:
+    """urllib.request.urlopen without redirect following (a 3xx surfaces as HTTPError)."""
+    return _OPENER.open(req, timeout=timeout)
 _MIN_HTTP_TIMEOUT_SECONDS = 1.0
 
 # Per-thread wall-clock deadline for AMP HTTP calls made inside one Hermes hook
@@ -104,7 +121,7 @@ class AmpClient:
                     body=body[:500],
                 ) from exc
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="ignore")
+            body = exc.read().decode("utf-8", errors="ignore")[:_ERROR_BODY_LIMIT]
             raise AmpClientError(
                 f"HTTP {exc.code}: {body or exc.reason}", status_code=exc.code, body=body
             ) from exc

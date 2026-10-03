@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import tempfile
 import threading
 from typing import Any, Dict, Optional, Tuple
 
@@ -32,7 +33,7 @@ def _state_path() -> Path:
     # session state to the wrong place under a non-default profile or on
     # Windows.
     state_dir = get_hermes_home() / "plugin_state" / "amp-governance"
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     return state_dir / "sessions.json"
 
 
@@ -136,18 +137,18 @@ class SessionStore:
     def _save_all(self, data: Dict[str, SessionRecord]) -> None:
         serializable = {key: asdict(value) for key, value in data.items()}
         text = json.dumps(serializable, indent=2) + "\n"
-        tmp_path = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
+        # mkstemp: unpredictable name, O_EXCL (no symlink following), mode 0600 from creation.
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{self._path.name}.", suffix=".tmp", dir=self._path.parent)
         try:
-            tmp_path.write_text(text)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass  # e.g. NTFS under WSL ignores POSIX modes; the key digest is the real protection
-            os.replace(tmp_path, self._path)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, self._path)
         finally:
-            if tmp_path.exists():
+            if os.path.exists(tmp_name):
                 try:
-                    tmp_path.unlink()
+                    os.unlink(tmp_name)
                 except OSError:
                     pass
 

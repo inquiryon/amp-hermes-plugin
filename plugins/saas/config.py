@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Dict
@@ -77,7 +77,7 @@ def _bool_value(env_file: Dict[str, str], default: bool, *names: str) -> bool:
 @dataclass(frozen=True)
 class AmpConfig:
     backend_url: str
-    api_key: str
+    api_key: str = field(repr=False)  # never in reprs/logs
     org_id: str
     agent_name: str
     username: str
