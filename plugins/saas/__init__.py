@@ -18,7 +18,7 @@ import uuid
 from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Set, Tuple
 
 from . import hitl_poll
-from .amp_client import AmpClient, AmpClientError, request_deadline
+from .amp_client import AmpClient, AmpClientError, best_effort, request_deadline, window_open
 from .config import AmpConfig, load_config
 from .execution_context import ExecutionContext, ExecutionContextStore, LlmCallRecord
 from .hitl_poll import DecisionLedger, PollOutcome, poll_for_decision, reviewer_note
@@ -64,6 +64,12 @@ def _http_client_error_code(exc: BaseException) -> Optional[int]:
     if isinstance(code, int) and code < 500:
         return code
     return None
+
+
+def _proven_outage(exc: BaseException) -> bool:
+    """True only when AMP was provably not reached (refused / DNS, before sending).
+    The only failure AMP_FAIL_CLOSED=false may turn into an allow (Codex HIGH#3)."""
+    return isinstance(exc, AmpClientError) and exc.status_code is None and bool(getattr(exc, "pre_send", False))
 
 
 def _request_may_have_landed(exc: BaseException) -> bool:
@@ -112,26 +118,32 @@ class _InstanceFileLock:
         self._path = path
         self._fd: Optional[int] = None
 
-    def try_acquire(self) -> bool:
+    ACQUIRED = "acquired"
+    BUSY = "busy"
+    UNAVAILABLE = "unavailable"
+
+    def try_acquire(self) -> str:
+        """ACQUIRED, BUSY (another process holds it) or UNAVAILABLE (no flock here)."""
         if self._path is None or _fcntl is None:
-            return True
+            self._warn("no lock path or fcntl")
+            return self.UNAVAILABLE
         try:
             self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+            fd = os.open(self._path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
         except OSError as exc:
             self._warn(exc)
-            return True
+            return self.UNAVAILABLE
         try:
             _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
-            return False
+            return self.BUSY
         except OSError as exc:
             os.close(fd)
             self._warn(exc)
-            return True
+            return self.UNAVAILABLE
         self._fd = fd
-        return True
+        return self.ACQUIRED
 
     def release(self) -> None:
         if self._fd is None:
@@ -143,11 +155,11 @@ class _InstanceFileLock:
             self._fd = None
 
     @classmethod
-    def _warn(cls, exc: OSError) -> None:
+    def _warn(cls, exc: object) -> None:
         if not cls._warned:
             cls._warned = True
-            logger.warning("amp-governance: cross-process review lock unavailable (%s); "
-                           "run one Hermes process per session", exc)
+            logger.warning("amp-governance: cross-process review lock unavailable (%s); unscoped "
+                           "reviews are blocked -- enable AMP_ACTION_ID_CORRELATION", exc)
 
 
 @dataclass(frozen=True)
@@ -170,6 +182,8 @@ class _ReviewSlot:
     unregistered: bool = False
     baseline_workitem: str = ""
     baselined: bool = False
+    # Not acquired because cross-process locking is unavailable (not merely busy).
+    lock_unavailable: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -565,8 +579,10 @@ class AmpGovernancePlugin:
         return instance_id
 
     def _safe_log(self, instance_id: str, message: str, *, level: str = "INFO") -> None:
+        """Best-effort: capped at 2 s and skipped once the governance window has ended (F3)."""
         try:
-            self._client.log(instance_id, message, level=level)
+            with best_effort():
+                self._client.log(instance_id, message, level=level)
         except Exception as exc:
             logger.warning("amp-governance log failed: %s", exc)
 
@@ -575,7 +591,8 @@ class AmpGovernancePlugin:
 
     def _safe_set_state(self, instance_id: str, state: str) -> None:
         try:
-            self._client.set_state(instance_id, state)
+            with best_effort():
+                self._client.set_state(instance_id, state)
         except Exception as exc:
             logger.warning("amp-governance set_state(%s) failed: %s", state, exc)
 
@@ -615,17 +632,30 @@ class AmpGovernancePlugin:
         digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()[:16]
         return store_path.parent / "locks" / f"{digest}.lock"
 
-    def _acquire_review_locks(self, instance_id: str, deadline: float) -> Optional[_InstanceFileLock]:
-        """Take the in-process and cross-process review locks, or None by ``deadline``."""
+    def _acquire_review_locks(
+        self, instance_id: str, deadline: float, *, require_file_lock: bool
+    ) -> Tuple[Optional[_InstanceFileLock], str]:
+        """Take the in-process and cross-process review locks by ``deadline``.
+
+        Returns (lock, "") or (None, reason). An unscoped review (no action_id) is only
+        safe when other processes are excluded too, so with ``require_file_lock`` an
+        unavailable flock is a failure (Codex HIGH#2), not a silent downgrade.
+        """
         thread_lock = self._instance_lock(instance_id)
         file_lock = _InstanceFileLock(self._instance_lock_path(instance_id))
         while True:
             if thread_lock.acquire(blocking=False):
-                if file_lock.try_acquire():
-                    return file_lock
+                state = file_lock.try_acquire()
+                if state == _InstanceFileLock.ACQUIRED:
+                    return file_lock, ""
+                if state == _InstanceFileLock.UNAVAILABLE:
+                    if not require_file_lock:
+                        return file_lock, ""  # release() is a no-op without an fd
+                    thread_lock.release()
+                    return None, "unavailable"
                 thread_lock.release()
             if time.time() >= deadline:
-                return None
+                return None, "busy"
             time.sleep(_SLOT_POLL_SECONDS)
 
     def _note_unregistered(self, instance_id: str, slot: _ReviewSlot) -> None:
@@ -703,9 +733,9 @@ class AmpGovernancePlugin:
         workitems meanwhile, identifies the workitem that is *not* ours.
         """
         self._ensure_ledger_seeded(instance_id)
-        file_lock = self._acquire_review_locks(instance_id, deadline)
+        file_lock, reason = self._acquire_review_locks(instance_id, deadline, require_file_lock=baseline)
         if file_lock is None:
-            yield _ReviewSlot(acquired=False)
+            yield _ReviewSlot(acquired=False, lock_unavailable=reason == "unavailable")
             return
         thread_lock = self._instance_lock(instance_id)
         try:
@@ -716,6 +746,19 @@ class AmpGovernancePlugin:
                 file_lock.release()
             finally:
                 thread_lock.release()
+
+    @staticmethod
+    def _slot_refused_message(slot: _ReviewSlot, subject: str) -> str:
+        if slot.lock_unavailable:
+            return (
+                f"AMP review lock unavailable (no cross-process file lock on this platform or "
+                f"filesystem); {subject} was blocked. Enable AMP_ACTION_ID_CORRELATION to review "
+                "without it."
+            )
+        return (
+            f"Another governed call in this session is still waiting for AMP review; "
+            f"{subject} was blocked. One approval at a time: retry after that review."
+        )
 
     def _unregistered_message(self, subject: str) -> str:
         return (
@@ -758,7 +801,11 @@ class AmpGovernancePlugin:
         self._dispatch_tool = getattr(ctx, "dispatch_tool", None)
 
     def _notify_user(self, message: str) -> None:
-        """Send a best-effort governance notification to the originating channel."""
+        """Send a best-effort governance notification to the originating channel.
+        Skipped once the governance window has ended, so it cannot overrun a hook."""
+        if not window_open():
+            logger.info("amp-governance: notification skipped (governance window ended)")
+            return
         notify_user(
             self._dispatch_tool,
             message,
@@ -810,7 +857,7 @@ class AmpGovernancePlugin:
             if not slot.acquired:
                 exec_ctx.llm_blocked += 1
                 exec_ctx.status = "blocked"
-                return "block", "Another governed call is still waiting for AMP review; LLM call blocked."
+                return "block", self._slot_refused_message(slot, "the LLM call")
             if slot.unregistered:
                 exec_ctx.llm_blocked += 1
                 exec_ctx.status = "blocked"
@@ -912,18 +959,22 @@ class AmpGovernancePlugin:
                 return "block", message
             self._safe_log(
                 instance_id,
-                f"AMP unavailable for LLM policy check: {exc}",
+                f"AMP unavailable for LLM policy check: {_truncate(str(exc), 200)}",
                 level="WARN",
             )
             exec_ctx.status = "running"
-            if self._config.llm_governance_fail_closed:
+            if self._config.llm_governance_fail_closed or not _proven_outage(exc):
                 self._safe_log(
                     instance_id,
                     "Fail-closed: blocking LLM call due to AMP unavailability",
                 )
                 exec_ctx.llm_blocked += 1
                 exec_ctx.status = "blocked"
-                return "block", "AMP governance unavailable; LLM call blocked (fail-closed)."
+                return "block", (
+                    "AMP governance unavailable; LLM call blocked (fail-closed)."
+                    if _proven_outage(exc)
+                    else "AMP governance check failed and AMP may have received the request; LLM call blocked."
+                )
             self._safe_log(
                 instance_id,
                 "Fail-open: allowing LLM call despite AMP unavailability",
@@ -962,7 +1013,7 @@ class AmpGovernancePlugin:
             )
             return "allow", ""
 
-        if status in {"pending", "waiting-for-response"} or response.get("workitem_id"):
+        if status in {"pending", "waiting-for-response"}:
             workitem_id = str(response.get("workitem_id") or "").strip()
             exec_ctx.hitl_workitem_id = workitem_id
             exec_ctx.status = "hitl_pending"
@@ -994,13 +1045,14 @@ class AmpGovernancePlugin:
                     accept_unbound=slot.accept_unbound,
                 )
                 self._record_spent(instance_id, outcome.workitem_id)
-                if not outcome.workitem_id and outcome.kind not in hitl_poll.TERMINAL_KINDS:
-                    self._note_unregistered(instance_id, slot)
+                if not outcome.workitem_id and outcome.kind != hitl_poll.APPROVED:
+                    self._note_unregistered(instance_id, slot)  # F1: any unbound end
                 self._safe_set_state(instance_id, "active")
             return self._llm_outcome(exec_ctx, instance_id, api_call_count, outcome)
 
         # Unexpected status (e.g. a reserved "deny"): AMP answered, so this is not an
         # outage and AMP_LLM_GOVERNANCE_FAIL_CLOSED=false does not apply.
+        self._record_spent(instance_id, str(response.get("workitem_id") or "").strip())
         exec_ctx.llm_blocked += 1
         exec_ctx.status = "blocked"
         self._safe_log(
@@ -1165,10 +1217,7 @@ class AmpGovernancePlugin:
         # lock still keeps unscoped LLM/plan polls on this instance from interleaving.
         with self._review_slot(instance_id, deadline=budget.deadline, baseline=not action_id) as slot:
             if not slot.acquired:
-                return self._block_message(
-                    f"Another governed call in this session is still waiting for AMP review; "
-                    f"{action.raw_tool_name} was blocked. One approval at a time: retry after that review."
-                )
+                return self._block_message(self._slot_refused_message(slot, action.raw_tool_name))
             if slot.unregistered:
                 return self._block_message(self._unregistered_message(action.raw_tool_name))
             return self._evaluate_governance_in_slot(
@@ -1188,6 +1237,11 @@ class AmpGovernancePlugin:
     ) -> Optional[Dict[str, str]]:
         self._ensure_ledger_seeded(instance_id)
         reused = self._ledger.take_pending(instance_id, call_fingerprint)
+        if reused is not None and slot.baselined and slot.baseline_workitem != reused[0]:
+            # F2: get-decision only reports the newest workitem; once a newer one exists
+            # the old review can never be seen again, so open a fresh one instead.
+            self._safe_log(instance_id, f"Pending review {reused[0]} is no longer the newest; opening a new review")
+            reused = None
         if reused is not None:
             workitem_id, reused_action_id = reused
             self._safe_log(
@@ -1236,12 +1290,20 @@ class AmpGovernancePlugin:
                 ).strip()
                 self._safe_log(instance_id, message, level="ERROR")
                 return self._block_message(message)
-            message = (
-                f"AMP governance is unavailable; blocked {action.raw_tool_name}. "
-                f"Error: {_truncate(str(exc), 200)}"
-            )
+            if not isinstance(exc, AmpClientError):
+                message = (
+                    f"AMP governance failed locally while checking {action.raw_tool_name}; blocked. "
+                    f"Error: {_truncate(str(exc), 200)}"
+                )
+            else:
+                message = (
+                    f"AMP governance is unavailable; blocked {action.raw_tool_name}. "
+                    f"Error: {_truncate(str(exc), 200)}"
+                )
             self._safe_log(instance_id, message, level="ERROR")
-            if self._config.fail_closed or time.time() >= budget.deadline:
+            # Fail-open covers only a proven pre-send outage; an uncertain POST or a local
+            # error always blocks (Codex HIGH#3 / F5).
+            if self._config.fail_closed or not _proven_outage(exc) or time.time() >= budget.deadline:
                 return self._block_message(message)
             return None
 
@@ -1276,7 +1338,7 @@ class AmpGovernancePlugin:
         if status in {"no-hitl", "allow", "allowed", "approved"}:
             return None
 
-        if status in {"pending", "waiting-for-response"} or response.get("workitem_id"):
+        if status in {"pending", "waiting-for-response"}:
             return self._await_tool_review(
                 instance_id, action, budget=budget,
                 workitem_id=str(response.get("workitem_id") or "").strip(),
@@ -1286,6 +1348,8 @@ class AmpGovernancePlugin:
 
         # AMP answered with something that is not an allow (e.g. a reserved "deny" or an
         # unknown status). That is not an outage, so AMP_FAIL_CLOSED=false does not apply.
+        # A workitem it names must never decide a later call.
+        self._record_spent(instance_id, str(response.get("workitem_id") or "").strip())
         return self._block_message(
             f'AMP returned unexpected status "{status or "unknown"}" for {action.raw_tool_name}; blocked.'
         )
@@ -1332,8 +1396,10 @@ class AmpGovernancePlugin:
         bound = outcome.workitem_id
         # Consumed or abandoned: no later call may act on this workitem's decision ...
         self._record_spent(instance_id, bound)
-        if not bound and outcome.kind not in hitl_poll.TERMINAL_KINDS:
-            # Even with action_id, a late workitem could be bound by an unscoped LLM/plan poll.
+        if not bound and outcome.kind != hitl_poll.APPROVED:
+            # F1: any outcome that ends with no workitem bound (timeout, unverifiable, poll
+            # refused, watchdog, errors) may leave a late workitem behind. Even with
+            # action_id it could be bound by an unscoped LLM/plan poll.
             self._note_unregistered(instance_id, slot)
         if outcome.kind not in hitl_poll.TERMINAL_KINDS:
             # ... except an identical retry, which waits on the still-open review (A19).
@@ -1450,6 +1516,12 @@ class AmpGovernancePlugin:
             self._notify_user(f'AMP review timed out for "{tool}". The action was blocked.')
             return self._block_message(f"{tool} timed out waiting for AMP HITL approval." + retry_hint)
         # REJECTED and anything unrecognised
+        if outcome.detail not in {"", "reject", "rejected"}:
+            # e.g. "defer": not a reviewer rejection (F7).
+            word = "deferred" if outcome.detail in {"defer", "deferred"} else f"'{outcome.detail}'"
+            message = f"{tool} was not approved: the AMP review was {word}, not approved; blocked." + suffix
+            self._notify_user(message)
+            return self._block_message(message)
         self._notify_user(f'AMP reviewer rejected "{tool}".' + suffix)
         return self._block_message(f"{tool} was rejected by AMP HITL review." + suffix)
 
@@ -1483,6 +1555,14 @@ class AmpGovernancePlugin:
         exec_ctx.approved_budget_usd = approved_budget_usd
 
     def evaluate_proposed_plan(self, session_id: str, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """See _evaluate_proposed_plan. Every AMP call of the plan approval, including
+        instance init and submission, runs under the Hermes tool deadline (F3)."""
+        started_at = time.time()
+        budget = self._wait_budget(started_at, include_hook=False)
+        with request_deadline(budget.deadline):
+            return self._evaluate_proposed_plan(session_id, plan, started_at)
+
+    def _evaluate_proposed_plan(self, session_id: str, plan: Dict[str, Any], started_at: float) -> Dict[str, Any]:
         """Submit a proposed execution plan to AMP for governance approval (Phase 3A).
 
         This is the public plan-governance interface: it accepts a plan dict,
@@ -1496,7 +1576,6 @@ class AmpGovernancePlugin:
         composing the plan (reading config, calling a planning LLM, reacting to a
         chat trigger) is the caller's responsibility, not AHP's.
         """
-        started_at = time.time()
         plan = plan if isinstance(plan, dict) else {}
         plan_type = str(plan.get("plan_type") or "").strip()
         projected_cost_usd = plan.get("projected_cost_usd")
@@ -1535,8 +1614,7 @@ class AmpGovernancePlugin:
         with self._review_slot(instance_id, deadline=budget.deadline) as slot:
             if not slot.acquired:
                 return self._plan_result(
-                    "error", plan_id=plan_id,
-                    reason="Another governed call is still waiting for AMP review; plan not submitted.",
+                    "error", plan_id=plan_id, reason=self._slot_refused_message(slot, "the plan"),
                 )
             if slot.unregistered:
                 return self._plan_result("error", plan_id=plan_id, reason=self._unregistered_message("the plan"))
@@ -1604,7 +1682,7 @@ class AmpGovernancePlugin:
                 )
                 return self._plan_result("approved", plan_id=plan_id, approved_budget_usd=cost, reason=reason)
 
-            if status in {"pending", "waiting-for-response"} or response.get("workitem_id"):
+            if status in {"pending", "waiting-for-response"}:
                 # workitem_id is always empty at this point -- AMP's synchronous
                 # /api/hitl/request response for a still-pending decision doesn't
                 # include it yet (it's created moments later by a separate
@@ -1634,11 +1712,12 @@ class AmpGovernancePlugin:
                         accept_unbound=slot.accept_unbound,
                     )
                     self._record_spent(instance_id, outcome.workitem_id)
-                    if not outcome.workitem_id and outcome.kind not in hitl_poll.TERMINAL_KINDS:
-                        self._note_unregistered(instance_id, slot)
+                    if not outcome.workitem_id and outcome.kind != hitl_poll.APPROVED:
+                        self._note_unregistered(instance_id, slot)  # F1: any unbound end
                     self._safe_set_state(instance_id, "active")
                 return self._plan_outcome(session_id, instance_id, plan_id, cost, outcome)
 
+            self._record_spent(instance_id, str(response.get("workitem_id") or "").strip())
             self._safe_log(instance_id, f"Plan unexpected AMP status '{status}' | plan_id={plan_id}", level="WARN")
             return self._plan_result(
                 "error", plan_id=plan_id,
@@ -1920,8 +1999,9 @@ class AmpGovernancePlugin:
                 return self._block_message(message)
             # AMP_FAIL_CLOSED=false only covers AMP being unreachable. A local error
             # (store, notification, bug) after or before AMP answered is never an allow.
-            is_outage = isinstance(exc, AmpClientError) and exc.status_code is None
-            if self._config.fail_closed or not is_outage or time.time() >= budget.deadline:
+            # Fail-open only for a proven pre-send outage; store-lock timeouts, local bugs and
+            # init answers without an instance id always block (Codex HIGH#3 / F5).
+            if self._config.fail_closed or not _proven_outage(exc) or time.time() >= budget.deadline:
                 message = (
                     f'AMP governance failed while checking "{tool_name}": {_truncate(str(exc), 200)}'
                 )

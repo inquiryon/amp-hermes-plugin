@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import socket
 import threading
 import time
 from typing import Any, Dict, Iterator, Optional
@@ -42,12 +43,25 @@ _deadline_state = threading.local()
 class AmpClientError(RuntimeError):
     """An AMP call failed. ``status_code`` is the HTTP status when AMP answered
     (None for network errors, timeouts and exhausted deadlines); ``body`` is
-    the raw response body AMP sent with that status, if any."""
+    the raw response body AMP sent with that status, if any. ``pre_send`` is True
+    only when the request provably never reached AMP (connection refused, DNS
+    failure, deadline already exhausted): the only case fail-open may allow."""
 
-    def __init__(self, message: str, *, status_code: Optional[int] = None, body: str = "") -> None:
+    def __init__(
+        self, message: str, *, status_code: Optional[int] = None, body: str = "", pre_send: bool = False
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.pre_send = pre_send
+
+
+# Connection errors that happen before any request byte is sent.
+_PRE_SEND_ERRORS = (ConnectionRefusedError, socket.gaierror)
+
+# Best-effort calls (logs, state, notifications) inside a governance window get at
+# most this long each, and none once the window has ended.
+_BEST_EFFORT_CAP_SECONDS = 2.0
 
 
 @contextmanager
@@ -70,6 +84,24 @@ def request_deadline(at: Optional[float], *, hard: bool = False) -> Iterator[Non
         _deadline_state.value = previous
 
 
+def window_open() -> bool:
+    """False once the calling thread's governance deadline has passed."""
+    state = getattr(_deadline_state, "value", None)
+    return state is None or time.time() < state[0]
+
+
+@contextmanager
+def best_effort() -> Iterator[None]:
+    """Bound a best-effort AMP call: <= 2 s, and refused outright (AmpClientError)
+    once the current governance deadline has passed, so logging can never push a
+    hook past Hermes's limit."""
+    state = getattr(_deadline_state, "value", None)
+    cap = time.time() + _BEST_EFFORT_CAP_SECONDS
+    at = cap if state is None else min(state[0], cap)
+    with request_deadline(at, hard=True):
+        yield
+
+
 def _http_timeout() -> float:
     state = getattr(_deadline_state, "value", None)
     if state is None:
@@ -77,7 +109,7 @@ def _http_timeout() -> float:
     at, hard = state
     remaining = at - time.time()
     if remaining <= 0 and hard:
-        raise AmpClientError("AMP request deadline exhausted")
+        raise AmpClientError("AMP request deadline exhausted", pre_send=True)
     return min(_DEFAULT_HTTP_TIMEOUT_SECONDS, max(remaining, _MIN_HTTP_TIMEOUT_SECONDS))
 
 
@@ -126,7 +158,9 @@ class AmpClient:
                 f"HTTP {exc.code}: {body or exc.reason}", status_code=exc.code, body=body
             ) from exc
         except URLError as exc:
-            raise AmpClientError(str(exc.reason)) from exc
+            # urllib wraps connect *and* send errors in URLError: only refused/DNS
+            # prove the request never reached AMP.
+            raise AmpClientError(str(exc.reason), pre_send=isinstance(exc.reason, _PRE_SEND_ERRORS)) from exc
         except (TimeoutError, OSError) as exc:
             # A read timeout or reset after the connection was established is
             # not wrapped in URLError; surface it as an AMP failure so callers

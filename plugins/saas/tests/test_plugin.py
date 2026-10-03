@@ -515,7 +515,7 @@ class ToolGovernanceRegressionTests(unittest.TestCase):
     def test_url_error_with_fail_open_still_allows(self) -> None:
         # Regression: the operator's explicit outage policy is unchanged for real outages.
         plugin = make_plugin(fail_closed=False)
-        plugin._client.request_hitl = Mock(side_effect=AmpClientError("connection refused"))
+        plugin._client.request_hitl = Mock(side_effect=AmpClientError("connection refused", pre_send=True))
         with quiet(plugin):
             result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
         self.assertIsNone(result)

@@ -263,6 +263,8 @@ def _poll(
         if remaining <= 0:
             break
         time.sleep(min(max(float(interval_seconds), 1.0), remaining))
+        if time.time() >= deadline:
+            break  # never start a fetch after the deadline
         polls += 1
         try:
             decision = fetch()
@@ -317,7 +319,8 @@ def _poll(
                 kind = MODIFIED
             else:
                 kind = REJECTED  # reject, defer, unknown, missing: never an allow
-            return PollOutcome(kind, workitem_id or bound, information=information, polls=polls)
+            return PollOutcome(kind, workitem_id or bound, information=information, polls=polls,
+                               detail=resolution if kind == REJECTED else "")
 
         if status in _CANCELLED or _lower(decision.get("workitem_status")) in _CANCELLED:
             if workitem_id and workitem_id != bound and action_id is None:

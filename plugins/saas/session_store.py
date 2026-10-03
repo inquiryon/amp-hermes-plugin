@@ -32,6 +32,17 @@ SPENT_WORKITEMS_LIMIT = 50
 _KEY_DIGEST_RE = re.compile(r"^[0-9a-f]{%d}$" % _KEY_DIGEST_CHARS)
 
 
+# How long a store operation waits for another Hermes process holding sessions.json.
+_STORE_LOCK_TIMEOUT_SECONDS = 5.0
+_STORE_LOCK_POLL_SECONDS = 0.02
+
+
+class StoreLockError(OSError):
+    """sessions.json could not be locked in time (or locking is unavailable).
+
+    Callers on a governance path must treat this as a block, never as an outage."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -122,33 +133,45 @@ _RECORD_FIELDS = frozenset(field.name for field in fields(SessionRecord))
 
 
 class SessionStore:
-    def __init__(self, path: Optional[Path] = None) -> None:
+    def __init__(self, path: Optional[Path] = None, *, lock_timeout: float = _STORE_LOCK_TIMEOUT_SECONDS) -> None:
         self._path = path or _state_path()
         self._thread_lock = threading.Lock()
+        self._lock_timeout = lock_timeout
 
     @contextmanager
     def _lock_ctx(self) -> Iterator[None]:
-        """Thread lock plus a flock on sessions.json.lock, so another Hermes process
-        cannot interleave a load/save and drop consumed workitems or review markers."""
-        with self._thread_lock:
-            fd = None
+        """Thread lock plus a non-blocking, deadline-bound flock on sessions.json.lock, so
+        another Hermes process cannot interleave a load/save and drop consumed workitems
+        or review markers. Raises StoreLockError when the lock is not obtained in time."""
+        deadline = time.time() + self._lock_timeout
+        if not self._thread_lock.acquire(timeout=max(self._lock_timeout, 0.0)):
+            raise StoreLockError("session store busy (thread lock)")
+        fd = None
+        try:
             if _fcntl is not None:
                 try:
                     fd = os.open(f"{self._path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
-                    _fcntl.flock(fd, _fcntl.LOCK_EX)
                 except OSError as exc:
-                    logger.warning("amp-governance: session store lock unavailable: %s", exc)
-                    if fd is not None:
-                        os.close(fd)
-                    fd = None
-            try:
-                yield
-            finally:
-                if fd is not None:
+                    raise StoreLockError(f"session store lock unavailable: {exc}") from exc
+                while True:
                     try:
-                        _fcntl.flock(fd, _fcntl.LOCK_UN)
-                    finally:
-                        os.close(fd)
+                        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.time() >= deadline:
+                            raise StoreLockError("session store busy (another Hermes process)") from None
+                        time.sleep(_STORE_LOCK_POLL_SECONDS)
+                    except OSError as exc:
+                        raise StoreLockError(f"session store lock unavailable: {exc}") from exc
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
+            self._thread_lock.release()
 
     def _load_all(self) -> Tuple[Dict[str, SessionRecord], bool]:
         """Return (records, needs_rewrite). needs_rewrite is True when a record

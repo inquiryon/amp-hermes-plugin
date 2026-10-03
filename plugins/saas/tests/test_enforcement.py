@@ -367,11 +367,14 @@ class PolicyOutcomeTests(unittest.TestCase):
         next_call.assert_not_called()
 
     def test_amp_unavailable_fail_open_allows_provider(self):
+        # Transport outage proven before sending (connection refused): fail-open applies.
+        from hermes.amp_client import AmpClientError
+
         plugin = _make_plugin(fail_closed=False)
         exec_ctx = _make_exec_ctx()
         plugin._exec_contexts._store["sess-1"] = exec_ctx
         plugin._client = Mock()
-        plugin._client.request_llm_hitl = Mock(side_effect=Exception("connection refused"))
+        plugin._client.request_llm_hitl = Mock(side_effect=AmpClientError("connection refused", pre_send=True))
         plugin._notify_user = Mock()
         next_call = _make_next_call("resp")
 
@@ -384,6 +387,40 @@ class PolicyOutcomeTests(unittest.TestCase):
 
         self.assertEqual(result, "resp")
         next_call.assert_called_once()
+
+    def test_local_error_blocks_even_when_fail_open(self):
+        # A local error (bug, serialization) is not an outage: never fail-open.
+        plugin = _make_plugin(fail_closed=False)
+        exec_ctx = _make_exec_ctx()
+        plugin._exec_contexts._store["sess-1"] = exec_ctx
+        plugin._client = Mock()
+        plugin._client.request_llm_hitl = Mock(side_effect=TypeError("Object of type X is not JSON serializable"))
+        plugin._notify_user = Mock()
+        next_call = _make_next_call("resp")
+        with patch.object(plugin, "_safe_log"), self.assertRaises(self.LEB):
+            plugin.llm_execution_middleware(
+                request={"messages": []}, next_call=next_call,
+                session_id="sess-1", model="m", provider="p", base_url="", api_call_count=1,
+            )
+        next_call.assert_not_called()
+
+    def test_uncertain_transport_error_blocks_even_when_fail_open(self):
+        # A read timeout after sending: AMP may have accepted the request.
+        from hermes.amp_client import AmpClientError
+
+        plugin = _make_plugin(fail_closed=False)
+        exec_ctx = _make_exec_ctx()
+        plugin._exec_contexts._store["sess-1"] = exec_ctx
+        plugin._client = Mock()
+        plugin._client.request_llm_hitl = Mock(side_effect=AmpClientError("read timed out"))
+        plugin._notify_user = Mock()
+        next_call = _make_next_call("resp")
+        with patch.object(plugin, "_safe_log"), self.assertRaises(self.LEB):
+            plugin.llm_execution_middleware(
+                request={"messages": []}, next_call=next_call,
+                session_id="sess-1", model="m", provider="p", base_url="", api_call_count=1,
+            )
+        next_call.assert_not_called()
 
     def test_amp_unavailable_fail_closed_raises_leb(self):
         plugin = _make_plugin(fail_closed=True)

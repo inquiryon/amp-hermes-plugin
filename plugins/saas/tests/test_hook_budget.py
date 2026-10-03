@@ -57,16 +57,23 @@ class HookBudgetTests(unittest.TestCase):
 
     def test_small_hook_budget_still_sends_the_first_request(self):
         # M1: a 10 s hook budget must not raise before the first request.
+        # Realistic shape: the request response has no workitem_id; the baseline shows an
+        # older workitem; this call's own workitem (wi-new) appears pending, then approved.
         plugin = make_plugin(hitl_poll_interval_seconds=1)
-        plugin._client.request_hitl = Mock(return_value=pending("wi-1"))
-        plugin._client.get_hitl_decision = Mock(side_effect=[pending("wi-1"), complete("approve", "wi-1")])
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(side_effect=[
+            complete("reject", "wi-old"), pending("wi-new"), complete("approve", "wi-new"),
+        ])
         self.assertIsNone(_run(plugin, FakeClock(), hook=10.0))
         plugin._client.request_hitl.assert_called_once()
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)
 
     def test_approval_inside_budget_allows(self):
         plugin = make_plugin(hitl_poll_interval_seconds=3)
-        plugin._client.request_hitl = Mock(return_value=pending("wi-1"))
-        plugin._client.get_hitl_decision = Mock(side_effect=[pending("wi-1")] * 5 + [complete("approve", "wi-1")])
+        plugin._client.request_hitl = Mock(return_value={"status": "waiting-for-response"})
+        plugin._client.get_hitl_decision = Mock(
+            side_effect=[complete("reject", "wi-old")] + [pending("wi-1")] * 5 + [complete("approve", "wi-1")]
+        )
         self.assertIsNone(_run(plugin, FakeClock(), hook=600.0, tool=420.0))
 
     def test_request_failure_after_budget_blocks_even_when_fail_open(self):
