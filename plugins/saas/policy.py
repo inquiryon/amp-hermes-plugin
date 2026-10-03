@@ -24,41 +24,73 @@ UNLISTED_ARGS_LIMIT_CHARS = 2000
 _TRUNCATION_MARKER = "\n...[truncated]"
 _REDACTED = "[REDACTED]"
 
-# Argument names whose values are never sent (case-insensitive substring match).
-_SECRET_KEY_RE = re.compile(r"(?i)(key|token|secret|passw|credential|auth|cookie|session)")
+# Only this much text is ever scanned/redacted for a preview or argument summary (the
+# hash and size still cover the full content). Bounds regex cost on huge writes.
+_REDACTION_INPUT_LIMIT = 8192
+
+# The plugin's own tools; everything else is governed when AMP_GOVERN_UNLISTED_TOOLS is on.
+OWN_TOOLS = frozenset({"amp_evaluate_research_plan", "amp_load_research_topics", "amp_governance_summary"})
+
+# Argument names whose values are never sent: a secret word as a whole name component
+# (api_key, X-Auth-Token, db_password), not as a substring (keyword, author).
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(?:^|[_\-.\s])(?:api[_-]?key|key|token|secret|passw(?:or)?d|pass|pwd|credentials?"
+    r"|auth(?:orization)?|cookie|private[_-]?key|access[_-]?key)(?:$|[_\-.\s])"
+)
+
+_SECRET_WORD = r"(?:pass(?:word|wd)?|pwd|secret|token|api[_-]?key|access[_-]?key|credential)"
 
 # Fallback value patterns, applied after Hermes's own redactor (agent.redact) when present.
+# All quantifiers are bounded so adversarial input cannot make them super-linear.
 _SECRET_VALUE_PATTERNS = (
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL),
-    re.compile(r"\bamp_k_[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"),
-    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"),
-    re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,}"),
+    # Only a real PEM block (base64 body + END marker); text after a bare BEGIN stays visible.
+    re.compile(
+        r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[A-Za-z0-9+/=\s]{1,16384}?-----END [A-Z ]{0,40}PRIVATE KEY-----"
+    ),
+    re.compile(r"\bamp_k_[A-Za-z0-9_\-]{8,200}"),
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,200}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,200}"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,200}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,2000}\.[A-Za-z0-9_\-]{10,2000}\.[A-Za-z0-9_\-]{10,2000}"),
+    # JSON: "db_password": "x", "client_secret": "y"
+    re.compile(r'(?i)("[^"\n]{0,40}' + _SECRET_WORD + r'[^"\n]{0,40}")(\s{0,5}:\s{0,5})"[^"\n]{0,4096}"'),
+    # Assignments: password=x, API_KEY: "y"
     re.compile(
-        r"(?i)\b([A-Za-z0-9_]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)[A-Za-z0-9_]*)"
-        r"(\s*[:=]\s*)(['\"]?)[^\s'\"]+\3"
+        r"(?i)\b([A-Za-z0-9_]{0,40}" + _SECRET_WORD + r"[A-Za-z0-9_]{0,40})(\s{0,5}[:=]\s{0,5})(['\"]?)[^\s'\"]{1,4096}\3"
     ),
 )
 
 
-def redact_secrets(text: str) -> str:
-    """Best-effort removal of credentials from text before it leaves the machine."""
-    redacted = str(text or "")
+def redact_secrets_counted(text: str) -> Tuple[str, int]:
+    """Best-effort removal of credentials; returns (text, number of redactions)."""
+    original = str(text or "")
+    redacted = original
+    count = 0
     try:  # Hermes's redactor knows many more credential formats; use it when installed
         from agent.redact import redact_sensitive_text
 
-        redacted = redact_sensitive_text(redacted, force=True)
+        hermes_redacted = redact_sensitive_text(redacted, force=True)
+        if hermes_redacted != redacted:
+            count += 1
+        redacted = hermes_redacted
     except Exception:
         pass
     for pattern in _SECRET_VALUE_PATTERNS:
-        if pattern.groups >= 2:
-            redacted = pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", redacted)
+        if pattern.groups >= 3:
+            redacted, n = pattern.subn(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", redacted)
+        elif pattern.groups == 2:
+            redacted, n = pattern.subn(lambda m: f'{m.group(1)}{m.group(2)}"{_REDACTED}"', redacted)
         else:
-            redacted = pattern.sub(_REDACTED, redacted)
-    return redacted
+            redacted, n = pattern.subn(_REDACTED, redacted)
+        count += n
+    return redacted, count
+
+
+def redact_secrets(text: str) -> str:
+    """Best-effort removal of credentials from text before it leaves the machine."""
+    return redact_secrets_counted(str(text or "")[:_REDACTION_INPUT_LIMIT * 4])[0]
 
 
 def _truncate_utf8(text: str, limit_bytes: int) -> Tuple[str, bool]:
@@ -72,10 +104,16 @@ def content_preview_fields(content: Any) -> Dict[str, Any]:
     """Preview (<= 2 KB, secrets redacted) plus hash and size of the full content."""
     text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, default=str)
     data = text.encode("utf-8")
-    preview, truncated = _truncate_utf8(redact_secrets(text), CONTENT_PREVIEW_LIMIT_BYTES)
+    redacted, redactions = redact_secrets_counted(text[:_REDACTION_INPUT_LIMIT])
+    preview, truncated = _truncate_utf8(redacted, CONTENT_PREVIEW_LIMIT_BYTES)
+    truncated = truncated or len(text) > _REDACTION_INPUT_LIMIT
+    if truncated and not preview.endswith(_TRUNCATION_MARKER):
+        preview += _TRUNCATION_MARKER
     return {
         "content_preview": preview,
         "content_preview_truncated": truncated,
+        # Tells the reviewer that parts of the preview were masked (they can't see those).
+        "content_redactions": redactions,
         "content_sha256": hashlib.sha256(data).hexdigest(),
         "content_bytes": len(data),
     }
@@ -102,8 +140,8 @@ def _drop_secret_keys(value: Any) -> Any:
 
 def unlisted_tool_context(args: Dict[str, Any]) -> Dict[str, Any]:
     text = json.dumps(_drop_secret_keys(args), sort_keys=True, default=str)
-    preview = redact_secrets(text)
-    truncated = len(preview) > UNLISTED_ARGS_LIMIT_CHARS
+    preview = redact_secrets_counted(text[:_REDACTION_INPUT_LIMIT])[0]
+    truncated = len(preview) > UNLISTED_ARGS_LIMIT_CHARS or len(text) > _REDACTION_INPUT_LIMIT
     if truncated:
         preview = preview[:UNLISTED_ARGS_LIMIT_CHARS] + _TRUNCATION_MARKER
     return {"arguments": preview, "arguments_truncated": truncated}
@@ -121,7 +159,7 @@ def normalize_tool_call(
     include_content_preview (AMP_SEND_CONTENT_PREVIEW, default off) adds a redacted
     <= 2 KB preview plus sha256/size of what write_file/patch will write, so a reviewer
     can see the change. govern_unlisted (AMP_GOVERN_UNLISTED_TOOLS, default off)
-    governs every other tool except the plugin's own amp_* tools.
+    governs every other tool except the plugin's own tools (OWN_TOOLS).
     """
     if not isinstance(args, dict):
         args = {}
@@ -197,7 +235,7 @@ def normalize_tool_call(
             context={"urls": urls if isinstance(urls, list) else []},
         )
 
-    if govern_unlisted and tool_name and not tool_name.startswith("amp_"):
+    if govern_unlisted and tool_name and tool_name not in OWN_TOOLS:
         return NormalizedAction(
             raw_tool_name=tool_name,
             tool=tool_name,

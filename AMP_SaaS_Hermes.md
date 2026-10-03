@@ -56,7 +56,7 @@ Hermes tools are normalized into AMP policy vocabulary like this:
 - `web_search` → `exec/web_search`
 - `web_extract` → `exec/web_extract`
 
-Other tools are not governed unless `AMP_GOVERN_UNLISTED_TOOLS=true` (SaaS plugin, off by default). With that set, every other tool except the plugin's own `amp_*` tools is sent as `<tool name>/invoke` with its arguments (secret-looking keys and values redacted, capped at 2,000 chars). Each extra tool call costs one AMP request against the monthly call limit.
+Other tools are not governed unless `AMP_GOVERN_UNLISTED_TOOLS=true` (SaaS plugin, off by default). With that set, every other tool except the plugin's own three tools (`amp_evaluate_research_plan`, `amp_load_research_topics`, `amp_governance_summary`) is sent as `<tool name>/invoke` with its arguments (secret-looking keys and values redacted, capped at 2,000 chars). Each extra tool call costs one AMP request against the monthly call limit.
 
 ## Additional behavior
 
@@ -267,7 +267,7 @@ Core environment variables, gathered here for quick lookup (see the relevant sec
 | `AMP_FAIL_CLOSED` | Block governed tools when AMP is unreachable. With `false`, a call is allowed **only** when AMP was provably not reached (connection refused or DNS failure before anything was sent); a timeout or reset after sending, a 5xx, a local error or a store-lock timeout still blocks, because AMP may have received the request. Anything AMP *answers* that is not an allow always blocks, whatever this says: HTTP 4xx, an unreadable or non-JSON body, an unknown status. An exhausted approval window always blocks too | `true` |
 | `AMP_ACTION_ID_CORRELATION` | Send the Hermes `tool_call_id` as `action_id` on the HITL request and decision poll, so AMP matches the decision to the exact call. Turn on only once your AMP HITL service stores `action_id` on the workitem | `false` |
 | `AMP_ACTION_ID_WATCHDOG_SECONDS` | With `AMP_ACTION_ID_CORRELATION=true`: block when AMP has not created a review for the call after this many seconds | `60` |
-| `AMP_SEND_CONTENT_PREVIEW` | Add `content_preview` (≤ 2 KB, secrets redacted), `content_sha256` and `content_bytes` of what `write_file`/`patch` will write to the HITL request, so the reviewer sees the change and not just the path. This sends file content to AMP; off until your privacy review approves it | `false` |
+| `AMP_SEND_CONTENT_PREVIEW` | Add `content_preview` (≤ 2 KB, secrets redacted), `content_sha256` and `content_bytes` of what `write_file`/`patch` will write to the HITL request, so the reviewer sees the change and not just the path. `content_redactions` counts the masked spots, so the reviewer knows part of the text is hidden. The hash is of the full, unredacted content, which makes a low-entropy file guessable by anyone with AMP access. This sends file content to AMP; off until your privacy review approves it | `false` |
 | `AMP_GOVERN_UNLISTED_TOOLS` | Govern tools outside the list in [What this plugin governs](#what-this-plugin-governs) | `false` |
 | `plugins.hook_callback_timeout` (Hermes `config.yaml`, not `.env`) | Hermes ≥ v2026.9 abandons a `pre_tool_call` hook after this many seconds. HITL reviews need `600` (the max). `0` disables the cap | `30` |
 | `timeouts.tools.sequential_call` / `timeouts.tools.concurrent_batch` (Hermes `config.yaml`) | Hermes's per-call / per-batch tool deadline. It also counts the time a call waits for review. Set both to `660` for a 10-minute window | `420` |
