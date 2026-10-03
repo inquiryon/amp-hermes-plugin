@@ -29,7 +29,10 @@ from hermes import (
     _TRACE_FIELD_CHARS,
     AmpGovernancePlugin,
 )
+from hermes.amp_client import AmpClient, AmpClientError
 from hermes.policy import NormalizedAction
+from hermes.session_store import SessionStore
+from hitl_helpers import FakeClock, complete, make_plugin, pending, quiet, terminal_action
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +328,9 @@ class NotificationBridgeTests(unittest.TestCase):
         plugin = AmpGovernancePlugin()
         plugin._notify_user = Mock()
         plugin._client.request_hitl = Mock(return_value={"status": "pending", "workitem_id": "w1"})
-        plugin._client.get_hitl_decision = Mock(return_value={"status": "complete", "resolution": "approved"})
+        plugin._client.get_hitl_decision = Mock(
+            return_value={"status": "complete", "resolution": "approved", "workitem_id": "w1"}
+        )
         plugin._config = SimpleNamespace(
             hitl_timeout_minutes=1,
             hitl_poll_interval_seconds=0,
@@ -348,7 +353,10 @@ class NotificationBridgeTests(unittest.TestCase):
         plugin._notify_user = Mock()
         plugin._client.request_hitl = Mock(return_value={"status": "pending", "workitem_id": "w1"})
         plugin._client.get_hitl_decision = Mock(
-            return_value={"status": "complete", "resolution": "rejected", "information": "Need human review"}
+            return_value={
+                "status": "complete", "resolution": "rejected",
+                "information": "Need human review", "workitem_id": "w1",
+            }
         )
         plugin._config = SimpleNamespace(
             hitl_timeout_minutes=1,
@@ -362,9 +370,12 @@ class NotificationBridgeTests(unittest.TestCase):
             result = plugin._evaluate_governance("inst-1", action)
         self.assertEqual(
             result,
-            {"action": "block", "message": "terminal was rejected by AMP HITL review. Need human review"},
+            {
+                "action": "block",
+                "message": "terminal was rejected by AMP HITL review. Reviewer note: Need human review",
+            },
         )
-        plugin._notify_user.assert_any_call('AMP reviewer rejected "terminal". Need human review')
+        plugin._notify_user.assert_any_call('AMP reviewer rejected "terminal". Reviewer note: Need human review')
 
     def test_timeout_hitl_sends_timeout_notification(self) -> None:
         plugin = AmpGovernancePlugin()
@@ -458,11 +469,79 @@ class ToolGovernanceRegressionTests(unittest.TestCase):
         self.assertIsNone(result)
         plugin._client.request_hitl.assert_not_called()
 
+    def test_policy_error_block_uses_backend_message(self) -> None:
+        plugin = make_plugin()
+        plugin._client.request_hitl = Mock(return_value={
+            "status": "policy_error", "reason": "policy_invalid_hitl_assignee", "message": "reviewer invalid",
+        })
+        with quiet(plugin):
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        self.assertEqual(result, {"action": "block", "message": "reviewer invalid"})
+
+    def test_http_400_reports_rejected_not_unavailable(self) -> None:
+        plugin = make_plugin()
+        plugin._client.request_hitl = Mock(side_effect=AmpClientError(
+            "HTTP 400: bad", status_code=400, body='{"error":"missing_username_in_meta"}',
+        ))
+        with quiet(plugin):
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertTrue(result["message"].startswith("AMP rejected the governance request"), result["message"])
+        self.assertIn("HTTP 400", result["message"])
+        self.assertIn("missing_username_in_meta", result["message"])
+
+    def test_http_4xx_blocks_even_when_fail_open(self) -> None:
+        # H2: a 4xx is AMP refusing the call, not an outage; AMP_FAIL_CLOSED=false must not allow it.
+        plugin = make_plugin(fail_closed=False)
+        plugin._client.request_hitl = Mock(side_effect=AmpClientError(
+            "HTTP 422: policy_error", status_code=422, body='{"status":"policy_error"}',
+        ))
+        with quiet(plugin):
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertIn("HTTP 422", result["message"])
+
+    def test_url_error_still_reports_unavailable(self) -> None:
+        plugin = make_plugin()
+        plugin._client.request_hitl = Mock(side_effect=AmpClientError("connection refused"))
+        with quiet(plugin):
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        assert result is not None
+        self.assertTrue(result["message"].startswith("AMP governance is unavailable"), result["message"])
+
+    def test_url_error_with_fail_open_still_allows(self) -> None:
+        # Regression: the operator's explicit outage policy is unchanged for real outages.
+        plugin = make_plugin(fail_closed=False)
+        plugin._client.request_hitl = Mock(side_effect=AmpClientError("connection refused"))
+        with quiet(plugin):
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        self.assertIsNone(result)
+
+    def test_pre_tool_call_not_blocked_by_corrupt_store(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+            store_path.write_text(json.dumps({
+                "s1": {"session_id": "s1", "instance_id": "inst-old", "future_field": 1},
+            }))
+            plugin = make_plugin()
+            plugin._store = SessionStore(path=store_path)
+            plugin._client.init_instance = Mock(return_value="inst-9")
+            plugin._client.request_hitl = Mock(return_value={"status": "no-hitl"})
+            with patch.object(plugin, "_safe_log"):
+                result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        self.assertIsNone(result)
+
     def test_transform_llm_output_replaces_blocked_turn(self) -> None:
         plugin = AmpGovernancePlugin()
         plugin._blocked_turn_messages["sess-1"] = "blocked reason"
         result = plugin.transform_llm_output(response_text="original", session_id="sess-1")
-        self.assertEqual(result, "This request is blocked by AMP governance. No action was taken.")
+        self.assertEqual(
+            result,
+            "This request is blocked by AMP governance. No action was taken.\nReason: blocked reason",
+        )
 
     def test_transform_llm_output_passthrough_when_not_blocked(self) -> None:
         plugin = AmpGovernancePlugin()
@@ -980,6 +1059,147 @@ class ReasoningExtractionHelperTests(unittest.TestCase):
 
     def test_summarize_answer_none_message(self) -> None:
         self.assertEqual(_summarize_assistant_answer(None), "")
+
+
+# ---------------------------------------------------------------------------
+# HITL resolutions: modify (A2) and cancelled (B2 forward-compat, contract K1)
+# ---------------------------------------------------------------------------
+
+class HitlResolutionTests(unittest.TestCase):
+    def _run(self, decisions, **config):
+        plugin = make_plugin(**config)
+        plugin._client.request_hitl = Mock(return_value=pending("w1"))
+        plugin._client.get_hitl_decision = Mock(side_effect=list(decisions))
+        clock = FakeClock()
+        with quiet(plugin), clock.installed():
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /x"}, session_id="s1")
+        return plugin, result
+
+    def test_modify_resolution_blocks_tool_and_never_returns_none(self) -> None:
+        plugin, result = self._run([
+            complete("modify", "w1", modified_action={"params": {"command": "ls /safe"}}),
+        ])
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertIn("modified version", result["message"])
+        plugin._notify_user.assert_any_call(result["message"])
+
+    def test_modified_spelling_also_blocks(self) -> None:
+        _, result = self._run([complete("modified", "w1")])
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+
+    def test_approve_still_allows(self) -> None:
+        _, result = self._run([complete("approved", "w1")])
+        self.assertIsNone(result)
+
+    def test_cancelled_status_blocks_immediately(self) -> None:
+        # Variant (b) shape: {status: cancelled}
+        plugin, result = self._run([{"status": "cancelled", "workitem_id": "w1"}])
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertIn("cancelled", result["message"])
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+
+    def test_cancelled_method_says_cancelled_not_rejected(self) -> None:
+        # Contract K1 shape.
+        _, result = self._run([{
+            "status": "complete", "resolution": "reject", "method": "cancelled",
+            "workitem_status": "Cancelled", "workitem_id": "w1", "information": "workitem cancelled",
+        }])
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertIn("cancelled", result["message"])
+        self.assertNotIn("rejected by AMP HITL review", result["message"])
+        self.assertIn("not rejected by a reviewer", result["message"])
+
+    def test_pending_body_with_cancelled_workitem_status_blocks(self) -> None:
+        _, result = self._run([pending("w1", workitem_status="Cancelled")])
+        assert result is not None
+        self.assertIn("cancelled", result["message"])
+
+    def test_plain_pending_keeps_polling(self) -> None:
+        plugin, result = self._run([pending("w1"), pending("w1"), complete("approve", "w1")])
+        self.assertIsNone(result)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)
+
+    def test_unknown_resolution_blocks(self) -> None:
+        _, result = self._run([complete("defer", "w1")])
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+
+
+# ---------------------------------------------------------------------------
+# Poll failures (A4)
+# ---------------------------------------------------------------------------
+
+class PollFailureTests(unittest.TestCase):
+    def _run(self, poll_side_effect, **config):
+        plugin = make_plugin(**config)
+        plugin._client.request_hitl = Mock(return_value=pending("w1"))
+        plugin._client.get_hitl_decision = Mock(side_effect=poll_side_effect)
+        clock = FakeClock()
+        with quiet(plugin), clock.installed():
+            result = plugin.pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1")
+        return plugin, result, clock
+
+    def test_poll_http_429_blocks_in_one_poll(self) -> None:
+        plugin, result, clock = self._run([AmpClientError(
+            "HTTP 429: limit", status_code=429, body='{"error":"call_limit_reached"}',
+        )])
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertIn("HTTP 429", result["message"])
+        self.assertIn("call_limit_reached", result["message"])
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+        self.assertLess(clock.elapsed, 5)
+
+    def test_poll_http_401_403_404_block_in_one_poll(self) -> None:
+        for code in (401, 403, 404):
+            with self.subTest(code=code):
+                plugin, result, _ = self._run([AmpClientError(f"HTTP {code}", status_code=code)])
+                assert result is not None
+                self.assertIn(f"HTTP {code}", result["message"])
+                self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+
+    def test_poll_http_429_blocks_even_when_fail_open(self) -> None:
+        _, result, _ = self._run([AmpClientError("HTTP 429", status_code=429)], fail_closed=False)
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+
+    def test_poll_http_500_keeps_polling(self) -> None:
+        plugin, result, _ = self._run([
+            AmpClientError("HTTP 500", status_code=500),
+            AmpClientError("HTTP 500", status_code=500),
+            complete("approve", "w1"),
+        ])
+        self.assertIsNone(result)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)
+
+    def test_poll_unexpected_exception_keeps_polling_never_allows(self) -> None:
+        plugin, result, _ = self._run([RuntimeError("boom"), complete("reject", "w1")], fail_closed=False)
+        assert result is not None
+        self.assertEqual(result["action"], "block")
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+
+    def test_amp_client_error_carries_status_code(self) -> None:
+        from io import BytesIO
+        from urllib.error import HTTPError
+
+        client = AmpClient(SimpleNamespace(backend_url="http://amp.invalid", api_key="k"))
+        error = HTTPError("http://amp.invalid/x", 403, "Forbidden", {}, BytesIO(b'{"error":"forbidden"}'))
+        with patch("hermes.amp_client.urlopen", side_effect=error):
+            with self.assertRaises(AmpClientError) as ctx:
+                client.get_hitl_decision("inst-1")
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(ctx.exception.body, '{"error":"forbidden"}')
+
+    def test_socket_timeout_becomes_amp_client_error(self) -> None:
+        client = AmpClient(SimpleNamespace(backend_url="http://amp.invalid", api_key="k"))
+        with patch("hermes.amp_client.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(AmpClientError) as ctx:
+                client.get_hitl_decision("inst-1")
+        self.assertIsNone(ctx.exception.status_code)
 
 
 if __name__ == "__main__":

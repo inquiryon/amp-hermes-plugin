@@ -1,4 +1,4 @@
-"""A5 (robust session store) and A17 (no raw API key at rest)."""
+"""A5 (robust session store), A17 (no raw API key at rest), A16b (finalize single-query runs)."""
 
 from __future__ import annotations
 
@@ -108,6 +108,61 @@ class ApiKeyAtRestTests(_TempStore):
         text = self.path.read_text()
         self.assertNotIn(RAW_KEY, text)
         self.assertEqual(len(self.on_disk()), 2)
+
+
+class SingleQueryFinalizeTests(_TempStore):
+    def _plugin_with_open_session(self):
+        plugin = make_plugin()
+        plugin._store = SessionStore(path=self.path)
+        plugin._client.init_instance = Mock(return_value="inst-1")
+        with patch.object(plugin, "_safe_log"):
+            plugin._ensure_instance("s1")
+        return plugin
+
+    def test_session_end_finalizes_in_single_query_mode(self) -> None:
+        plugin = self._plugin_with_open_session()
+        with patch.dict(os.environ, {"HERMES_SINGLE_QUERY_SESSION": "1"}), patch.object(plugin, "_safe_log"):
+            plugin.on_session_end(session_id="s1", completed=True)
+        plugin._client.set_state.assert_called_once_with("inst-1", "finished")
+        self.assertIsNone(plugin._store.get("s1"))
+
+    def test_session_end_is_ignored_for_interactive_sessions(self) -> None:
+        plugin = self._plugin_with_open_session()
+        plugin.on_session_end(session_id="s1", completed=True)
+        plugin._client.set_state.assert_not_called()
+        self.assertIsNotNone(plugin._store.get("s1"))
+
+    def test_atexit_fallback_finalizes_sessions_left_open(self) -> None:
+        plugin = self._plugin_with_open_session()
+        with patch.dict(os.environ, {"HERMES_SINGLE_QUERY_SESSION": "1"}), patch.object(plugin, "_safe_log"):
+            plugin.finalize_open_sessions_at_exit()
+            plugin.finalize_open_sessions_at_exit()  # idempotent
+        plugin._client.set_state.assert_called_once_with("inst-1", "finished")
+
+    def test_atexit_fallback_does_nothing_outside_single_query_mode(self) -> None:
+        plugin = self._plugin_with_open_session()
+        plugin.finalize_open_sessions_at_exit()
+        plugin._client.set_state.assert_not_called()
+
+    def test_exit_finalize_is_bounded_and_never_raises(self) -> None:
+        plugin = self._plugin_with_open_session()
+        plugin._client.set_state = Mock(side_effect=RuntimeError("AMP down"))
+        with patch.dict(os.environ, {"HERMES_SINGLE_QUERY_SESSION": "1"}), patch.object(plugin, "_safe_log"):
+            plugin.on_session_end(session_id="s1")
+        self.assertIsNone(plugin._store.get("s1"))
+
+    def test_register_wires_on_session_end(self) -> None:
+        import hermes as mod
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(
+            dispatch_tool=Mock(), register_hook=Mock(), register_middleware=Mock(),
+            register_tool=Mock(), register_skill=Mock(), register_cli_command=Mock(),
+        )
+        with patch.object(mod, "_PLUGIN", make_plugin()):
+            mod.register(ctx)
+        hooks = {c.args[0] for c in ctx.register_hook.call_args_list}
+        self.assertIn("on_session_end", hooks)
 
 
 if __name__ == "__main__":

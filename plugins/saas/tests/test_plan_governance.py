@@ -79,7 +79,9 @@ def _hitl_response(workitem_id="w-1"):
 
 
 def _decision(resolution="approved", info=""):
-    return {"status": "complete", "resolution": resolution, "information": info}
+    # AMP always echoes the workitem_id; the plugin only accepts a decision for the
+    # workitem its request is bound to (stale-decision guard).
+    return {"status": "complete", "resolution": resolution, "information": info, "workitem_id": "w-1"}
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +237,48 @@ class DecisionOutcomeTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # 3. ExecutionContext interaction
 # ---------------------------------------------------------------------------
+
+class PlanFailClosedTests(unittest.TestCase):
+    """A2, A4 and K1 on the plan-approval path."""
+
+    def _run(self, decisions):
+        plugin = _make_plugin()
+        plugin._client.request_plan_approval = Mock(return_value=_hitl_response())
+        plugin._client.get_hitl_decision = Mock(side_effect=list(decisions))
+        with patch.object(plugin, "_ensure_instance", return_value="inst-1"), \
+             patch.object(plugin, "_safe_log"), patch("time.sleep", return_value=None):
+            return plugin, plugin.evaluate_proposed_plan("s", _valid_plan(projected_cost_usd=4.75))
+
+    def test_hitl_modified_plan_is_rejected_not_approved(self):
+        plugin, result = self._run([_decision("modify")])
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("re-submit the modified plan", result["reason"])
+        self.assertIsNone(result["approved_budget_usd"])
+        self.assertIsNone(plugin._exec_contexts.get("s"))
+
+    def test_cancelled_plan_review_is_rejected_with_cancel_reason(self):
+        _, result = self._run([{
+            "status": "complete", "resolution": "reject", "method": "cancelled", "workitem_id": "w-1",
+        }])
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("cancelled", result["reason"])
+
+    def test_plan_poll_429_returns_error_in_one_poll(self):
+        from hermes.amp_client import AmpClientError
+
+        plugin, result = self._run([AmpClientError("HTTP 429", status_code=429, body="call_limit_reached")])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("HTTP 429", result["reason"])
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+
+    def test_plan_ignores_decision_for_other_workitem(self):
+        plugin, result = self._run([
+            {"status": "complete", "resolution": "approve", "workitem_id": "w-OLD"},
+            _decision("approved"),
+        ])
+        self.assertEqual(result["status"], "approved")
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+
 
 class ExecutionContextInteractionTests(unittest.TestCase):
     def test_existing_context_fields_untouched(self):

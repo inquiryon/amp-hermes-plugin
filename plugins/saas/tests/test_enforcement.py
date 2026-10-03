@@ -115,7 +115,9 @@ def _hitl_response(workitem_id="w-1"):
 
 
 def _decision(resolution="approved", info=""):
-    return {"status": "complete", "resolution": resolution, "information": info}
+    # AMP always echoes the workitem_id; the plugin only accepts a decision for the
+    # workitem its request is bound to (stale-decision guard).
+    return {"status": "complete", "resolution": resolution, "information": info, "workitem_id": "w-1"}
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +446,91 @@ class PolicyOutcomeTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # 4. Provider-call behavior
 # ---------------------------------------------------------------------------
+
+class LlmFailClosedTests(unittest.TestCase):
+    """A1 (LLM half), A2, A4, K1 and H2 on the LLM middleware path."""
+
+    def setUp(self):
+        self.LEB = _use_llm_blocked(self)
+
+    def _run(self, plugin, amp_response=None, decisions=None, request_error=None):
+        exec_ctx = _make_exec_ctx()
+        plugin._exec_contexts._store["sess-1"] = exec_ctx
+        plugin._client = Mock()
+        if request_error is not None:
+            plugin._client.request_llm_hitl = Mock(side_effect=request_error)
+        else:
+            plugin._client.request_llm_hitl = Mock(return_value=amp_response)
+        if decisions is not None:
+            plugin._client.get_hitl_decision = Mock(side_effect=list(decisions))
+        plugin._notify_user = Mock()
+        with patch.object(plugin, "_safe_log"), patch("time.sleep", return_value=None):
+            return plugin._evaluate_llm_governance(
+                exec_ctx, "m", "p", "", "sess-1", {"messages": []}, 1
+            )
+
+    def test_policy_error_blocks_llm_call_even_when_fail_open(self):
+        plugin = _make_plugin(fail_closed=False)
+        decision = self._run(plugin, {"status": "policy_error", "message": "bad route"})
+        self.assertEqual(decision, ("block", "bad route"))
+
+    def test_config_error_without_message_blocks(self):
+        plugin = _make_plugin(fail_closed=False)
+        decision, reason = self._run(plugin, {"status": "config_error"})
+        self.assertEqual(decision, "block")
+        self.assertTrue(reason)
+
+    def test_hitl_modify_blocks_llm_call(self):
+        plugin = _make_plugin()
+        decision, reason = self._run(plugin, _hitl_response(), [_decision("modify")])
+        self.assertEqual(decision, "block")
+        self.assertIn("reviewer requested modifications", reason)
+
+    def test_cancelled_decision_blocks_llm_call(self):
+        plugin = _make_plugin()
+        decision, reason = self._run(
+            plugin, _hitl_response(),
+            [{"status": "complete", "resolution": "reject", "method": "cancelled", "workitem_id": "w-1"}],
+        )
+        self.assertEqual(decision, "block")
+        self.assertIn("cancelled", reason)
+
+    def test_poll_403_blocks_llm_call_in_one_poll(self):
+        from hermes.amp_client import AmpClientError
+
+        plugin = _make_plugin()
+        decision, reason = self._run(
+            plugin, _hitl_response(), [AmpClientError("HTTP 403", status_code=403, body="forbidden")]
+        )
+        self.assertEqual(decision, "block")
+        self.assertIn("HTTP 403", reason)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 1)
+
+    def test_request_4xx_blocks_llm_call_even_when_fail_open(self):
+        from hermes.amp_client import AmpClientError
+
+        plugin = _make_plugin(fail_closed=False)
+        decision, reason = self._run(
+            plugin, request_error=AmpClientError("HTTP 429", status_code=429, body="call_limit_reached")
+        )
+        self.assertEqual(decision, "block")
+        self.assertIn("HTTP 429", reason)
+
+    def test_stale_decision_for_other_workitem_is_ignored(self):
+        plugin = _make_plugin()
+        decision, _ = self._run(
+            plugin, _hitl_response("w-2"),
+            [{"status": "complete", "resolution": "approve", "workitem_id": "w-OLD"},
+             {"status": "complete", "resolution": "reject", "workitem_id": "w-2"}],
+        )
+        self.assertEqual(decision, "block")
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)
+
+    def test_reviewer_note_is_labelled_on_reject(self):
+        plugin = _make_plugin()
+        _, reason = self._run(plugin, _hitl_response(), [_decision("reject", "too costly")])
+        self.assertIn("Reviewer note: too costly", reason)
+
 
 class ProviderCallBehaviorTests(unittest.TestCase):
     def setUp(self):

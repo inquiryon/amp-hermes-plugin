@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import atexit
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import re
+import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
-from .amp_client import AmpClient, AmpClientError
+from . import hitl_poll
+from .amp_client import AmpClient, AmpClientError, request_deadline
 from .config import AmpConfig, load_config
 from .execution_context import ExecutionContext, ExecutionContextStore, LlmCallRecord
+from .hitl_poll import DecisionLedger, PollOutcome, poll_for_decision, reviewer_note
+from .host_limits import WaitBudget, compute_budget, hook_timeout_seconds, limits_shorter_than, tool_deadline_seconds
 from .notification import notify_user
 from .policy import NormalizedAction, normalize_tool_call
 from .research_config import load_research_topics
@@ -41,6 +48,33 @@ def _truncate(value: str, limit: int = 220) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit - 3]}..."
+
+
+# Total time the exit-time finalize (single-query runs) may spend talking to AMP.
+_EXIT_FINALIZE_BUDGET_SECONDS = 3.0
+
+
+def _http_client_error_code(exc: BaseException) -> Optional[int]:
+    """HTTP status when AMP answered with a 4xx, else None (network error, 5xx, timeout)."""
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int) and 400 <= code < 500:
+        return code
+    return None
+
+
+def _call_fingerprint(action: NormalizedAction, args: Any) -> str:
+    """Identify one exact governed call (tool, action, full args) without storing the args."""
+    try:
+        canonical = json.dumps(args, sort_keys=True, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        canonical = repr(args)
+    digest = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
+    return f"{action.raw_tool_name}|{action.tool}|{action.action}|{digest}"
+
+
+def _is_single_query_process() -> bool:
+    """True under `hermes -z` / `hermes chat -q` (finite, one-turn runs)."""
+    return os.environ.get("HERMES_SINGLE_QUERY_SESSION") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +406,12 @@ class AmpGovernancePlugin:
         # a matching post_api_request (e.g. an error path) can't leak memory.
         self._pending_prompts: Dict[str, str] = {}
         self._pending_prompts_lock = threading.Lock()
+        # Workitems already consumed/abandoned per AMP instance (stale-decision guard)
+        # and still-pending reviews an identical retry may reuse.
+        self._ledger = DecisionLedger()
+        # Sessions this process initialised and has not finalised yet (exit-time finalize).
+        self._open_sessions: Set[str] = set()
+        self._open_sessions_lock = threading.Lock()
 
     def _warn_unconfigured(self) -> None:
         if self._warned_unconfigured:
@@ -399,6 +439,8 @@ class AmpGovernancePlugin:
     ) -> str:
         fingerprint = self._config_fingerprint()
         record = self._store.get(session_id)
+        with self._open_sessions_lock:
+            self._open_sessions.add(session_id)
         if record and record.agent_fingerprint == fingerprint:
             return record.instance_id
         reconnected = record is not None
@@ -426,6 +468,33 @@ class AmpGovernancePlugin:
 
     def _block_message(self, reason: str) -> Dict[str, str]:
         return {"action": "block", "message": reason}
+
+    def _safe_set_state(self, instance_id: str, state: str) -> None:
+        try:
+            self._client.set_state(instance_id, state)
+        except Exception as exc:
+            logger.warning("amp-governance set_state(%s) failed: %s", state, exc)
+
+    def _wait_budget(self, started_at: float, *, include_hook: bool) -> WaitBudget:
+        """Time this call may wait for AMP: the shortest of AMP_HITL_TIMEOUT_MINUTES, the
+        Hermes hook timeout (hooks only) and the Hermes tool deadline, minus a margin."""
+        return compute_budget(
+            started_at,
+            self._config.hitl_timeout_minutes * 60,
+            hook_timeout=hook_timeout_seconds() if include_hook else None,
+            tool_deadline=tool_deadline_seconds(),
+        )
+
+    @staticmethod
+    def _announce_wait(subject: str, workitem_id: str) -> None:
+        """One console/log line per review so a blocked-looking CLI run is explained (L5)."""
+        line = f"AMP: waiting for approval of {subject} (workitem {workitem_id or 'not yet assigned'})"
+        logger.warning(line)
+        try:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     def _record_blocked_turn(self, session_id: str, reason: str) -> None:
         if not session_id:
@@ -538,6 +607,18 @@ class AmpGovernancePlugin:
                 llm_calls_total=exec_ctx.llm_calls,
             )
         except Exception as exc:
+            rejected_code = _http_client_error_code(exc)
+            if rejected_code is not None:
+                # AMP answered and refused (bad key, org, call limit, payload): never an
+                # outage, so fail-open does not apply (H2).
+                message = (
+                    f"AMP rejected the LLM governance request (HTTP {rejected_code}); LLM call blocked. "
+                    f"{_truncate(getattr(exc, 'body', '') or str(exc), 200)}"
+                ).strip()
+                self._safe_log(instance_id, message, level="ERROR")
+                exec_ctx.llm_blocked += 1
+                exec_ctx.status = "blocked"
+                return "block", message
             self._safe_log(
                 instance_id,
                 f"AMP unavailable for LLM policy check: {exc}",
@@ -573,6 +654,11 @@ class AmpGovernancePlugin:
             exec_ctx.status = "blocked"
             return "block", f'No active AMP governance policy for agent "{self._config.agent_name}".'
 
+        if status in {"policy_error", "config_error", "error"}:
+            exec_ctx.llm_blocked += 1
+            exec_ctx.status = "blocked"
+            return "block", str(response.get("message") or reason or "AMP policy is misconfigured; LLM call blocked.")
+
         if status in {"no-hitl", "allow", "allowed", "approved"}:
             exec_ctx.status = "running"
             self._safe_log(
@@ -598,59 +684,19 @@ class AmpGovernancePlugin:
                 f"LLM HITL requested | workitem_id={workitem_id} | waiting_for={self._config.username}",
                 level="WARN",
             )
-            deadline = time.time() + (self._config.hitl_timeout_minutes * 60)
-            while time.time() < deadline:
-                time.sleep(max(self._config.hitl_poll_interval_seconds, 1))
-                try:
-                    decision = self._client.get_hitl_decision(instance_id)
-                except AmpClientError as exc:
-                    logger.warning("amp-governance LLM decision poll failed: %s", exc)
-                    continue
-                if str(decision.get("status") or "").strip().lower() != "complete":
-                    continue
-                resolution = str(decision.get("resolution") or "").strip().lower()
-                info = str(decision.get("information") or "").strip()
-                self._safe_log(
-                    instance_id,
-                    f"LLM HITL resolution | resolution={resolution}"
-                    + (f" | {info}" if info else ""),
-                    level="WARN" if resolution not in {"approve", "approved", "modify", "modified"} else "INFO",
-                )
-                if resolution in {"approve", "approved", "modify", "modified"}:
-                    exec_ctx.llm_hitl_approved += 1
-                    exec_ctx.status = "resuming"
-                    self._notify_user(
-                        "Approval received. Resuming LLM execution."
-                        + (f"\n{info}" if info else "")
-                    )
-                    self._safe_log(
-                        instance_id,
-                        f"LLM HITL approved | execution_id={exec_ctx.execution_id} | call=#{api_call_count}",
-                    )
-                    return "allow", ""
-                exec_ctx.llm_blocked += 1
-                exec_ctx.status = "blocked"
-                self._notify_user(
-                    f"AMP reviewer rejected LLM execution."
-                    + (f" {info}" if info else "")
-                )
-                self._safe_log(
-                    instance_id,
-                    f"LLM HITL rejected | execution_id={exec_ctx.execution_id} | call=#{api_call_count}"
-                    + (f" | {info}" if info else ""),
-                    level="WARN",
-                )
-                return "block", f"LLM execution rejected by AMP HITL review.{' ' + info if info else ''}"
-            # Timeout
-            exec_ctx.llm_blocked += 1
-            exec_ctx.status = "blocked"
-            self._notify_user("AMP review timed out. LLM execution was blocked.")
-            self._safe_log(
-                instance_id,
-                f"LLM HITL timed out | execution_id={exec_ctx.execution_id} | call=#{api_call_count}",
-                level="WARN",
+            self._announce_wait("the next LLM call", workitem_id)
+            outcome = poll_for_decision(
+                lambda: self._client.get_hitl_decision(instance_id),
+                instance_id=instance_id,
+                ledger=self._ledger,
+                deadline=time.time() + (self._config.hitl_timeout_minutes * 60),
+                interval_seconds=self._config.hitl_poll_interval_seconds,
+                bound_workitem_id=workitem_id,
+                label="LLM ",
             )
-            return "block", "LLM execution timed out waiting for AMP HITL approval."
+            self._ledger.mark_spent(instance_id, outcome.workitem_id)
+            self._safe_set_state(instance_id, "active")
+            return self._llm_outcome(exec_ctx, instance_id, api_call_count, outcome)
 
         # Unexpected status
         if self._config.llm_governance_fail_closed:
@@ -669,6 +715,69 @@ class AmpGovernancePlugin:
             level="WARN",
         )
         return "allow", ""
+
+    def _llm_outcome(
+        self,
+        exec_ctx: ExecutionContext,
+        instance_id: str,
+        api_call_count: int,
+        outcome: PollOutcome,
+    ) -> Tuple[str, str]:
+        """Map a HITL poll outcome to ("allow"|"block", reason). Only APPROVED allows."""
+        note = reviewer_note(outcome.information)
+        if outcome.kind != hitl_poll.TIMED_OUT:
+            self._safe_log(
+                instance_id,
+                f"LLM HITL resolution | outcome={outcome.kind}"
+                + (f" | workitem_id={outcome.workitem_id}" if outcome.workitem_id else "")
+                + (f" | {_truncate(outcome.information)}" if outcome.information else ""),
+                level="INFO" if outcome.kind == hitl_poll.APPROVED else "WARN",
+            )
+        if outcome.kind == hitl_poll.APPROVED:
+            exec_ctx.llm_hitl_approved += 1
+            exec_ctx.status = "resuming"
+            self._notify_user("Approval received. Resuming LLM execution." + (f"\n{note}" if note else ""))
+            self._safe_log(
+                instance_id,
+                f"LLM HITL approved | execution_id={exec_ctx.execution_id} | call=#{api_call_count}",
+            )
+            return "allow", ""
+
+        exec_ctx.llm_blocked += 1
+        exec_ctx.status = "blocked"
+        suffix = f" {note}" if note else ""
+        if outcome.kind == hitl_poll.MODIFIED:
+            reason = "LLM call not executed: reviewer requested modifications." + suffix
+            self._notify_user(reason)
+        elif outcome.kind == hitl_poll.CANCELLED:
+            reason = (
+                "LLM call blocked: the AMP review was cancelled before a reviewer decided "
+                "(not a reviewer rejection)."
+            )
+            self._notify_user(reason)
+        elif outcome.kind == hitl_poll.POLL_REJECTED:
+            reason = (
+                f"AMP rejected the HITL decision poll for the LLM call (HTTP {outcome.status_code}); "
+                f"blocked. {_truncate(outcome.detail, 160)}"
+            ).strip()
+            self._notify_user(reason)
+        elif outcome.kind in {hitl_poll.TIMED_OUT, hitl_poll.BUDGET_EXHAUSTED}:
+            self._notify_user("AMP review timed out. LLM execution was blocked.")
+            self._safe_log(
+                instance_id,
+                f"LLM HITL timed out | execution_id={exec_ctx.execution_id} | call=#{api_call_count}",
+                level="WARN",
+            )
+            reason = "LLM execution timed out waiting for AMP HITL approval."
+        else:  # REJECTED and anything unrecognised
+            self._notify_user("AMP reviewer rejected LLM execution." + suffix)
+            self._safe_log(
+                instance_id,
+                f"LLM HITL rejected | execution_id={exec_ctx.execution_id} | call=#{api_call_count}",
+                level="WARN",
+            )
+            reason = "LLM execution rejected by AMP HITL review." + suffix
+        return "block", reason
 
     def llm_execution_middleware(
         self,
@@ -735,20 +844,61 @@ class AmpGovernancePlugin:
         self,
         instance_id: str,
         action: NormalizedAction,
+        *,
+        budget: Optional[WaitBudget] = None,
+        action_id: Optional[str] = None,
+        call_fingerprint: str = "",
     ) -> Optional[Dict[str, str]]:
+        """Ask AMP whether a governed tool call may run. None = allow, else a block dict.
+
+        ``budget`` bounds the whole check (see host_limits); ``action_id`` is sent only
+        when AMP_ACTION_ID_CORRELATION is on; ``call_fingerprint`` lets an identical
+        retry reuse a review that is still pending (A19).
+        """
+        if budget is None:
+            budget = self._wait_budget(time.time(), include_hook=True)
+        reused = self._ledger.take_pending(instance_id, call_fingerprint)
+        if reused is not None:
+            workitem_id, reused_action_id = reused
+            self._safe_log(
+                instance_id,
+                f"Retry of a call still awaiting review | raw_tool={action.raw_tool_name} | "
+                f"reusing workitem_id={workitem_id}",
+            )
+            return self._await_tool_review(
+                instance_id, action, budget=budget, workitem_id=workitem_id,
+                action_id=reused_action_id, call_fingerprint=call_fingerprint,
+            )
+
         self._safe_log(
             instance_id,
             f"Policy check | raw_tool={action.raw_tool_name} | tool={action.tool} | action={action.action} | context={action.context}",
         )
         try:
-            response = self._client.request_hitl(instance_id, action)
+            if action_id:
+                response = self._client.request_hitl(instance_id, action, action_id=action_id)
+            else:
+                response = self._client.request_hitl(instance_id, action)
         except Exception as exc:
+            rejected_code = _http_client_error_code(exc)
+            if rejected_code is not None:
+                # AMP answered and refused (bad key, org, call limit, payload). That is a
+                # decision, not an outage, so AMP_FAIL_CLOSED=false must not allow it (H2).
+                message = (
+                    f"AMP rejected the governance request for {action.raw_tool_name} "
+                    f"(HTTP {rejected_code}); blocked. "
+                    f"{_truncate(getattr(exc, 'body', '') or str(exc), 200)}"
+                ).strip()
+                self._safe_log(instance_id, message, level="ERROR")
+                return self._block_message(message)
             message = f"AMP governance is unavailable; blocked {action.raw_tool_name}. Error: {exc}"
             self._safe_log(instance_id, message, level="ERROR")
-            if self._config.fail_closed:
+            if self._config.fail_closed or time.time() >= budget.deadline:
                 return self._block_message(message)
             return None
 
+        if not isinstance(response, dict):
+            response = {}
         status = str(response.get("status") or "").strip().lower()
         reason = str(response.get("reason") or response.get("information") or "").strip()
         self._safe_log(
@@ -762,8 +912,10 @@ class AmpGovernancePlugin:
             )
 
         if status in {"policy_error", "config_error", "error"}:
+            # Prefer AMP's human-readable message; `reason` is a code such as
+            # policy_invalid_hitl_assignee.
             return self._block_message(
-                reason or (
+                str(response.get("message") or "").strip() or reason or (
                     f'AMP policy for agent "{self._config.agent_name}" is misconfigured; '
                     f'"{action.raw_tool_name}" was blocked.'
                 )
@@ -773,51 +925,10 @@ class AmpGovernancePlugin:
             return None
 
         if status in {"pending", "waiting-for-response"} or response.get("workitem_id"):
-            deadline = time.time() + (self._config.hitl_timeout_minutes * 60)
-            self._safe_log(
-                instance_id,
-                f"HITL requested | raw_tool={action.raw_tool_name} | waiting_for={self._config.username}",
-                level="WARN",
-            )
-            self._notify_user(
-                f'AMP is waiting for a human reviewer to approve "{action.raw_tool_name}" before continuing. '
-                "This action is paused pending review."
-            )
-            while time.time() < deadline:
-                time.sleep(max(self._config.hitl_poll_interval_seconds, 1))
-                try:
-                    decision = self._client.get_hitl_decision(instance_id)
-                except AmpClientError as exc:
-                    logger.warning("amp-governance decision poll failed: %s", exc)
-                    continue
-                if str(decision.get("status") or "").strip().lower() != "complete":
-                    continue
-                resolution = str(decision.get("resolution") or "").strip().lower()
-                info = str(decision.get("information") or "").strip()
-                self._safe_log(
-                    instance_id,
-                    f"HITL resolution | raw_tool={action.raw_tool_name} | resolution={resolution}{f' | {info}' if info else ''}",
-                    level="WARN" if resolution not in {"approve", "approved", "modify", "modified"} else "INFO",
-                )
-                if resolution in {"approve", "approved", "modify", "modified"}:
-                    approval_message = (
-                        f'AMP review approved "{action.raw_tool_name}" with modifications. Continuing now.'
-                        if resolution in {"modify", "modified"}
-                        else f'AMP review approved "{action.raw_tool_name}". Continuing now.'
-                    )
-                    self._notify_user(approval_message)
-                    return None
-                self._notify_user(
-                    f'AMP reviewer rejected "{action.raw_tool_name}".{f" {info}" if info else ""}'
-                )
-                return self._block_message(
-                    f'{action.raw_tool_name} was rejected by AMP HITL review.{f" {info}" if info else ""}'
-                )
-            self._notify_user(
-                f'AMP review timed out for "{action.raw_tool_name}". The action was blocked.'
-            )
-            return self._block_message(
-                f'{action.raw_tool_name} timed out waiting for AMP HITL approval.'
+            return self._await_tool_review(
+                instance_id, action, budget=budget,
+                workitem_id=str(response.get("workitem_id") or "").strip(),
+                action_id=action_id, call_fingerprint=call_fingerprint,
             )
 
         if self._config.fail_closed:
@@ -825,6 +936,132 @@ class AmpGovernancePlugin:
                 f'AMP returned unexpected status "{status or "unknown"}" for {action.raw_tool_name}; blocked.'
             )
         return None
+
+    def _await_tool_review(
+        self,
+        instance_id: str,
+        action: NormalizedAction,
+        *,
+        budget: WaitBudget,
+        workitem_id: str,
+        action_id: Optional[str],
+        call_fingerprint: str,
+    ) -> Optional[Dict[str, str]]:
+        """Wait for the reviewer's decision on this call's workitem and map it to allow/block."""
+        tool = action.raw_tool_name
+        self._safe_log(
+            instance_id,
+            f"HITL requested | raw_tool={tool} | waiting_for={self._config.username}",
+            level="WARN",
+        )
+        self._notify_user(
+            f'AMP is waiting for a human reviewer to approve "{tool}" before continuing. '
+            "This action is paused pending review."
+        )
+        self._announce_wait(tool, workitem_id)
+        watchdog = getattr(self._config, "action_id_watchdog_seconds", 60) if action_id else None
+        outcome = poll_for_decision(
+            (lambda: self._client.get_hitl_decision(instance_id, action_id=action_id))
+            if action_id
+            else (lambda: self._client.get_hitl_decision(instance_id)),
+            instance_id=instance_id,
+            ledger=self._ledger,
+            deadline=budget.deadline,
+            interval_seconds=self._config.hitl_poll_interval_seconds,
+            budget_limited=budget.host_limited,
+            bound_workitem_id=workitem_id,
+            action_id=action_id,
+            watchdog_seconds=watchdog,
+        )
+        bound = outcome.workitem_id
+        if outcome.kind in hitl_poll.TERMINAL_KINDS:
+            self._ledger.mark_spent(instance_id, bound)
+        else:
+            # Gave up while the review is still open: never let a later call consume
+            # its decision, but let an identical retry wait on it (A19).
+            self._ledger.mark_spent(instance_id, bound)
+            self._ledger.remember_pending(instance_id, call_fingerprint, bound, action_id)
+        if outcome.kind != hitl_poll.TIMED_OUT:
+            self._safe_log(
+                instance_id,
+                f"HITL resolution | raw_tool={tool} | outcome={outcome.kind}"
+                + (f" | workitem_id={bound}" if bound else "")
+                + (f" | {_truncate(outcome.information)}" if outcome.information else ""),
+                level="INFO" if outcome.kind == hitl_poll.APPROVED else "WARN",
+            )
+        self._safe_set_state(instance_id, "active")
+        return self._tool_outcome(action, outcome, budget)
+
+    def _tool_outcome(
+        self, action: NormalizedAction, outcome: PollOutcome, budget: WaitBudget
+    ) -> Optional[Dict[str, str]]:
+        """Map a HITL poll outcome to None (allow) or a block. Only APPROVED allows."""
+        tool = action.raw_tool_name
+        note = reviewer_note(outcome.information)
+        suffix = f" {note}" if note else ""
+        if outcome.kind == hitl_poll.APPROVED:
+            self._notify_user(f'AMP review approved "{tool}". Continuing now.')
+            return None
+        if outcome.kind == hitl_poll.MODIFIED:
+            message = (
+                f'AMP reviewer approved a modified version of "{tool}". '
+                "The modified version was not applied, so the original call was blocked; "
+                "re-submit using the reviewer's changes." + suffix
+            )
+            self._notify_user(message)
+            return self._block_message(message)
+        if outcome.kind == hitl_poll.CANCELLED:
+            message = (
+                f'The AMP review of "{tool}" was cancelled before a reviewer decided'
+                + (f" (workitem {outcome.workitem_id})" if outcome.workitem_id else "")
+                + "; the action was blocked. It was not rejected by a reviewer."
+            )
+            self._notify_user(message)
+            return self._block_message(message)
+        if outcome.kind == hitl_poll.POLL_REJECTED:
+            message = (
+                f'AMP rejected the HITL decision poll for "{tool}" (HTTP {outcome.status_code}); '
+                f"blocked. {_truncate(outcome.detail, 160)}"
+            ).strip()
+            self._notify_user(message)
+            return self._block_message(message)
+        if outcome.kind == hitl_poll.CORRELATION_FAILED:
+            if outcome.detail == "watchdog":
+                seconds = int(getattr(self._config, "action_id_watchdog_seconds", 60))
+                message = (
+                    f"AMP has not created a review for {tool} after {seconds}s "
+                    "(action_id correlation may be unsupported by the HITL service); blocked."
+                )
+            else:
+                message = (
+                    f"AMP did not echo action_id for {tool} — the backend does not support "
+                    "decision correlation; blocked."
+                )
+            return self._block_message(message)
+        if outcome.kind in {hitl_poll.TIMED_OUT, hitl_poll.BUDGET_EXHAUSTED}:
+            retry_hint = (
+                f" The review is still open in AMP (workitem {outcome.workitem_id}). Do not retry this "
+                "call until a reviewer approves it; an identical retry in this session waits on the "
+                "same review instead of opening a new one."
+                if outcome.workitem_id
+                else " Do not retry this call until a reviewer approves it in AMP."
+            )
+            if outcome.kind == hitl_poll.BUDGET_EXHAUSTED:
+                self._notify_user(
+                    f'AMP review for "{tool}" did not finish within the Hermes time limit. '
+                    "The action was blocked."
+                )
+                return self._block_message(
+                    f'AMP review for "{tool}" did not complete within the {int(budget.limit_seconds)}s '
+                    f"Hermes limit ({budget.host_limit_name}); the action was blocked. Raise "
+                    "plugins.hook_callback_timeout (max 600) and timeouts.tools.sequential_call / "
+                    "concurrent_batch in Hermes config.yaml for longer reviews." + retry_hint
+                )
+            self._notify_user(f'AMP review timed out for "{tool}". The action was blocked.')
+            return self._block_message(f"{tool} timed out waiting for AMP HITL approval." + retry_hint)
+        # REJECTED and anything unrecognised
+        self._notify_user(f'AMP reviewer rejected "{tool}".' + suffix)
+        return self._block_message(f"{tool} was rejected by AMP HITL review." + suffix)
 
     @staticmethod
     def _plan_result(
@@ -869,6 +1106,7 @@ class AmpGovernancePlugin:
         composing the plan (reading config, calling a planning LLM, reacting to a
         chat trigger) is the caller's responsibility, not AHP's.
         """
+        started_at = time.time()
         plan = plan if isinstance(plan, dict) else {}
         plan_type = str(plan.get("plan_type") or "").strip()
         projected_cost_usd = plan.get("projected_cost_usd")
@@ -964,45 +1202,54 @@ class AmpGovernancePlugin:
                 "Awaiting approval in AMP..."
             )
 
-            deadline = time.time() + (self._config.hitl_timeout_minutes * 60)
-            while time.time() < deadline:
-                time.sleep(max(self._config.hitl_poll_interval_seconds, 1))
-                try:
-                    decision = self._client.get_hitl_decision(instance_id)
-                except AmpClientError as exc:
-                    logger.warning("amp-governance plan decision poll failed: %s", exc)
-                    continue
-                if str(decision.get("status") or "").strip().lower() != "complete":
-                    continue
-                resolution = str(decision.get("resolution") or "").strip().lower()
-                info = str(decision.get("information") or "").strip()
-                if resolution in {"approve", "approved", "modify", "modified"}:
-                    self._apply_approved_budget(session_id, instance_id, cost)
-                    self._notify_user(
-                        "Execution plan approved by AMP." + (f"\n{info}" if info else "")
-                        + "\nResearching now -- the report will follow shortly."
-                    )
-                    self._safe_log(
-                        instance_id,
-                        f"Plan HITL approved | plan_id={plan_id} | budget=${cost:.2f}",
-                    )
-                    return self._plan_result(
-                        "approved", plan_id=plan_id, approved_budget_usd=cost,
-                        reason=info, workitem_id=workitem_id,
-                    )
-                self._notify_user(
-                    "AMP reviewer rejected the execution plan." + (f" {info}" if info else "")
+            # Plan approval runs inside a tool call, so Hermes's tool deadline applies
+            # (not the hook timeout).
+            budget = self._wait_budget(started_at, include_hook=False)
+            self._announce_wait("the execution plan", workitem_id)
+            with request_deadline(budget.deadline):
+                outcome = poll_for_decision(
+                    lambda: self._client.get_hitl_decision(instance_id),
+                    instance_id=instance_id,
+                    ledger=self._ledger,
+                    deadline=budget.deadline,
+                    interval_seconds=self._config.hitl_poll_interval_seconds,
+                    budget_limited=budget.host_limited,
+                    bound_workitem_id=workitem_id,
+                    label="plan ",
                 )
-                self._safe_log(
-                    instance_id,
-                    f"Plan HITL rejected | plan_id={plan_id}" + (f" | {info}" if info else ""),
-                    level="WARN",
-                )
-                return self._plan_result(
-                    "rejected", plan_id=plan_id,
-                    reason=info or "Execution plan rejected by AMP HITL review.",
-                    workitem_id=workitem_id,
-                )
+                self._ledger.mark_spent(instance_id, outcome.workitem_id)
+                self._safe_set_state(instance_id, "active")
+            return self._plan_outcome(session_id, instance_id, plan_id, cost, outcome)
+
+        self._safe_log(instance_id, f"Plan unexpected AMP status '{status}' | plan_id={plan_id}", level="WARN")
+        return self._plan_result(
+            "error", plan_id=plan_id,
+            reason=f'AMP returned unexpected status "{status or "unknown"}".',
+        )
+
+    def _plan_outcome(
+        self,
+        session_id: str,
+        instance_id: str,
+        plan_id: str,
+        cost: float,
+        outcome: PollOutcome,
+    ) -> Dict[str, Any]:
+        """Map a HITL poll outcome to a plan result. Only APPROVED sets a budget."""
+        workitem_id = outcome.workitem_id or None
+        note = reviewer_note(outcome.information)
+        if outcome.kind == hitl_poll.APPROVED:
+            self._apply_approved_budget(session_id, instance_id, cost)
+            self._notify_user(
+                "Execution plan approved by AMP." + (f"\n{note}" if note else "")
+                + "\nResearching now -- the report will follow shortly."
+            )
+            self._safe_log(instance_id, f"Plan HITL approved | plan_id={plan_id} | budget=${cost:.2f}")
+            return self._plan_result(
+                "approved", plan_id=plan_id, approved_budget_usd=cost,
+                reason=note, workitem_id=workitem_id,
+            )
+        if outcome.kind in {hitl_poll.TIMED_OUT, hitl_poll.BUDGET_EXHAUSTED}:
             self._notify_user("AMP review of the execution plan timed out.")
             self._safe_log(instance_id, f"Plan HITL timed out | plan_id={plan_id}", level="WARN")
             return self._plan_result(
@@ -1010,12 +1257,27 @@ class AmpGovernancePlugin:
                 reason="Timed out waiting for AMP HITL approval.",
                 workitem_id=workitem_id,
             )
-
-        self._safe_log(instance_id, f"Plan unexpected AMP status '{status}' | plan_id={plan_id}", level="WARN")
-        return self._plan_result(
-            "error", plan_id=plan_id,
-            reason=f'AMP returned unexpected status "{status or "unknown"}".',
+        if outcome.kind == hitl_poll.POLL_REJECTED:
+            reason = (
+                f"AMP rejected the HITL decision poll (HTTP {outcome.status_code}); plan not approved. "
+                f"{_truncate(outcome.detail, 160)}"
+            ).strip()
+            self._safe_log(instance_id, f"Plan HITL poll rejected | plan_id={plan_id} | {reason}", level="WARN")
+            return self._plan_result("error", plan_id=plan_id, reason=reason, workitem_id=workitem_id)
+        if outcome.kind == hitl_poll.MODIFIED:
+            reason = "Reviewer modified the plan; re-submit the modified plan." + (f" {note}" if note else "")
+        elif outcome.kind == hitl_poll.CANCELLED:
+            reason = "The AMP review of the plan was cancelled before a reviewer decided; plan not approved."
+        else:
+            reason = note or "Execution plan rejected by AMP HITL review."
+        self._notify_user("AMP did not approve the execution plan. " + reason)
+        self._safe_log(
+            instance_id,
+            f"Plan HITL not approved | plan_id={plan_id} | outcome={outcome.kind}"
+            + (f" | {_truncate(outcome.information)}" if outcome.information else ""),
+            level="WARN",
         )
+        return self._plan_result("rejected", plan_id=plan_id, reason=reason, workitem_id=workitem_id)
 
     def on_session_start(self, session_id: str = "", model: str = "", platform: str = "", **_: Any) -> None:
         if not session_id:
@@ -1071,9 +1333,12 @@ class AmpGovernancePlugin:
                 except Exception as exc:
                     logger.warning("amp-governance execution summary log failed: %s", exc)
 
+        with self._open_sessions_lock:
+            self._open_sessions.discard(session_id)
         record = self._store.get(session_id)
         if not record:
             return
+        self._ledger.forget_instance(record.instance_id)
         try:
             self._safe_log(record.instance_id, f"Finalizing session | reason={reason or 'unknown'}")
             self._client.set_state(record.instance_id, "finished")
@@ -1081,6 +1346,39 @@ class AmpGovernancePlugin:
             logger.warning("amp-governance finalize failed: %s", exc)
         finally:
             self._store.delete(session_id)
+
+    def on_session_end(self, session_id: str = "", **_: Any) -> None:
+        """Finalize the AMP session at the end of a single-query run (A16b).
+
+        `hermes -z` / `hermes chat -q` never dispatch on_session_finalize and leave
+        via os._exit (no atexit), so the AMP instance would stay open and the
+        session record would leak. Interactive and gateway sessions span many
+        turns and are finalized by Hermes itself, so they are left alone.
+        """
+        if not session_id or not _is_single_query_process():
+            return
+        self._finalize_within_budget([session_id], reason="single_query_end")
+
+    def finalize_open_sessions_at_exit(self) -> None:
+        """atexit fallback for single-query runs that exit normally (best-effort, <= 3 s)."""
+        if not _is_single_query_process():
+            return
+        with self._open_sessions_lock:
+            open_sessions = sorted(self._open_sessions)
+        if open_sessions:
+            self._finalize_within_budget(open_sessions, reason="process_exit")
+
+    def _finalize_within_budget(self, session_ids: list, *, reason: str) -> None:
+        deadline = time.time() + _EXIT_FINALIZE_BUDGET_SECONDS
+        with request_deadline(deadline, hard=True):
+            for session_id in session_ids:
+                if time.time() >= deadline:
+                    logger.warning("amp-governance: exit finalize budget exhausted; %s left open", session_id)
+                    continue
+                try:
+                    self.on_session_finalize(session_id=session_id, reason=reason)
+                except Exception as exc:
+                    logger.warning("amp-governance exit finalize failed for %s: %s", session_id, exc)
 
     def pre_api_request(
         self,
@@ -1154,8 +1452,10 @@ class AmpGovernancePlugin:
         session_id: str = "",
         model: str = "",
         platform: str = "",
+        tool_call_id: str = "",
         **_: Any,
     ) -> Optional[Dict[str, str]]:
+        started_at = time.time()
         action = normalize_tool_call(tool_name, args)
         if action is None:
             return None
@@ -1166,15 +1466,24 @@ class AmpGovernancePlugin:
                     f'AMP governance is not configured; blocked governed tool "{tool_name}".'
                 )
             return None
+        # Return our own decision before Hermes's hook timeout / tool deadline fires (A3).
+        budget = self._wait_budget(started_at, include_hook=True)
+        action_id = None
+        if getattr(self._config, "action_id_correlation", False):
+            action_id = str(tool_call_id or "").strip() or uuid.uuid4().hex
         try:
-            instance_id = self._ensure_instance(session_id, model=model, platform=platform)
-            decision = self._evaluate_governance(instance_id, action)
+            with request_deadline(budget.deadline):
+                instance_id = self._ensure_instance(session_id, model=model, platform=platform)
+                decision = self._evaluate_governance(
+                    instance_id, action, budget=budget, action_id=action_id,
+                    call_fingerprint=_call_fingerprint(action, args),
+                )
             if decision and decision.get("action") == "block":
                 self._record_blocked_turn(session_id, str(decision.get("message") or ""))
             return decision
         except Exception as exc:
             logger.warning("amp-governance pre_tool_call failed: %s", exc)
-            if self._config.fail_closed:
+            if self._config.fail_closed or time.time() >= budget.deadline:
                 message = (
                     f'AMP governance failed while checking "{tool_name}": {exc}'
                 )
@@ -1331,7 +1640,12 @@ class AmpGovernancePlugin:
         blocked_reason = self._consume_blocked_turn_message(session_id)
         if not blocked_reason:
             return None
-        return "This request is blocked by AMP governance. No action was taken."
+        # Keep the cause visible (rejected vs cancelled vs timed out vs AMP error vs
+        # outage) instead of one generic line for every block (L15).
+        return (
+            "This request is blocked by AMP governance. No action was taken.\n"
+            f"Reason: {_truncate(blocked_reason, 700)}"
+        )
 
 
 _PLUGIN = AmpGovernancePlugin()
@@ -1546,16 +1860,51 @@ def _tool_amp_governance_summary(args: dict, **_: Any) -> str:
     return json.dumps(summary)
 
 
+_EXIT_FINALIZER_REGISTERED = False
+
+
+def _finalize_open_sessions_at_exit() -> None:
+    _PLUGIN.finalize_open_sessions_at_exit()
+
+
+def _register_exit_finalizer() -> None:
+    global _EXIT_FINALIZER_REGISTERED
+    if not _EXIT_FINALIZER_REGISTERED:
+        atexit.register(_finalize_open_sessions_at_exit)
+        _EXIT_FINALIZER_REGISTERED = True
+
+
+def _log_short_host_limits(config: AmpConfig) -> None:
+    """Say at startup when Hermes will cut HITL reviews short (L11)."""
+    try:
+        hitl_seconds = int(config.hitl_timeout_minutes) * 60
+        short = limits_shorter_than(hitl_seconds)
+    except Exception:
+        return
+    for name, seconds in short:
+        logger.error(
+            "amp-governance: Hermes %s=%gs is shorter than AMP_HITL_TIMEOUT_MINUTES=%d (%ds); "
+            "governed calls stop waiting for a reviewer after ~%gs and are blocked. Set "
+            "plugins.hook_callback_timeout: 600 and timeouts.tools.sequential_call / concurrent_batch: 660 "
+            "in Hermes config.yaml (or lower AMP_HITL_TIMEOUT_MINUTES).",
+            name, seconds, config.hitl_timeout_minutes, hitl_seconds,
+            compute_budget(0.0, hitl_seconds, hook_timeout=seconds, tool_deadline=None).deadline,
+        )
+
+
 def register(ctx) -> None:
     _PLUGIN.attach_context(ctx)
     ctx.register_hook("on_session_start", _PLUGIN.on_session_start)
     ctx.register_hook("on_session_finalize", _PLUGIN.on_session_finalize)
+    ctx.register_hook("on_session_end", _PLUGIN.on_session_end)
     ctx.register_hook("pre_llm_call", _PLUGIN.pre_llm_call)
     ctx.register_hook("pre_tool_call", _PLUGIN.pre_tool_call)
     ctx.register_hook("post_tool_call", _PLUGIN.post_tool_call)
     ctx.register_hook("pre_api_request", _PLUGIN.pre_api_request)
     ctx.register_hook("post_api_request", _PLUGIN.post_api_request)
     ctx.register_hook("transform_llm_output", _PLUGIN.transform_llm_output)
+    _register_exit_finalizer()
+    _log_short_host_limits(_PLUGIN._config)
 
     from .cli import register_cli, amp_command
     ctx.register_cli_command(
