@@ -54,13 +54,16 @@ Hermes tools are normalized into AMP policy vocabulary like this:
 - `write_file` → `write/write`
 - `patch` → `write/edit`
 - `web_search` → `exec/web_search`
+- `web_extract` → `exec/web_extract`
+
+Other tools are not governed unless `AMP_GOVERN_UNLISTED_TOOLS=true` (SaaS plugin, off by default). With that set, every other tool except the plugin's own three tools (`amp_evaluate_research_plan`, `amp_load_research_topics`, `amp_governance_summary`) is sent as `<tool name>/invoke` with its arguments (secret-looking keys and values redacted, capped at 2,000 chars). Each extra tool call costs one AMP request against the monthly call limit.
 
 ## Additional behavior
 
 Besides tool governance, the plugin also improves two parts of the Hermes user experience:
 
 - for prompts that appear time-sensitive or explicitly ask for live information, the plugin injects current-date context and tells Hermes to use `web_search` instead of answering from memory
-- when AMP triggers HITL, the plugin uses Hermes `send_message` to notify the active channel that the action is waiting for human review, then posts a follow-up when the reviewer approves, modifies, rejects, or times out the request
+- when AMP triggers HITL, the plugin uses Hermes `send_message` to notify the active channel that the action is waiting for human review, then posts a follow-up when the reviewer approves, rejects, or cancels the request, or it times out. A *modified* approval blocks the original call (the modified version is not applied automatically yet) and tells the user to re-submit.
 
 ## Prerequisites
 
@@ -259,10 +262,62 @@ Core environment variables, gathered here for quick lookup (see the relevant sec
 | `AMP_LLM_GOVERNANCE_FAIL_CLOSED` | Block LLM calls if AMP is unreachable | `false` |
 | `AMP_LLM_GOVERNANCE_INCLUDE_SUBAGENTS` | Track LLM calls from subagents launched by this session | `true` |
 | `AMP_NOTIFICATIONS_ENABLED` | Send HITL notifications to the originating chat channel | `true` |
-| `AMP_HITL_TIMEOUT_MINUTES` | HITL approval timeout | — |
-| `AMP_HITL_POLL_INTERVAL_SECONDS` | Poll interval while waiting on a HITL decision | — |
+| `AMP_HITL_TIMEOUT_MINUTES` | HITL approval timeout. The real window is also capped by Hermes (see [Approval window](#approval-window-hermes-time-limits)) | `10` |
+| `AMP_HITL_POLL_INTERVAL_SECONDS` | Poll interval while waiting on a HITL decision (minimum 1) | `3` |
+| `AMP_FAIL_CLOSED` | Block governed tools when AMP is unreachable. With `false`, a call is allowed **only** when AMP was provably not reached (connection refused or DNS failure before anything was sent); a timeout or reset after sending, a 5xx, a local error or a store-lock timeout still blocks, because AMP may have received the request. Anything AMP *answers* that is not an allow always blocks, whatever this says: HTTP 4xx, an unreadable or non-JSON body, an unknown status. An exhausted approval window always blocks too | `true` |
+| `AMP_ACTION_ID_CORRELATION` | Send the Hermes `tool_call_id` as `action_id` on the HITL request and decision poll, so AMP matches the decision to the exact call. Turn on only once your AMP HITL service stores `action_id` on the workitem | `false` |
+| `AMP_ACTION_ID_WATCHDOG_SECONDS` | With `AMP_ACTION_ID_CORRELATION=true`: block when AMP has not created a review for the call after this many seconds | `60` |
+| `AMP_SEND_CONTENT_PREVIEW` | Add `content_preview` (≤ 2 KB, secrets redacted), `content_sha256` and `content_bytes` of what `write_file`/`patch` will write to the HITL request, so the reviewer sees the change and not just the path. `content_redactions` counts the masked spots, so the reviewer knows part of the text is hidden. The hash is of the full, unredacted content, which makes a low-entropy file guessable by anyone with AMP access. This sends file content to AMP; off until your privacy review approves it | `false` |
+| `AMP_GOVERN_UNLISTED_TOOLS` | Govern tools outside the list in [What this plugin governs](#what-this-plugin-governs) | `false` |
+| `plugins.hook_callback_timeout` (Hermes `config.yaml`, not `.env`) | Hermes ≥ v2026.9 abandons a `pre_tool_call` hook after this many seconds. HITL reviews need `600` (the max). `0` disables the cap | `30` |
+| `timeouts.tools.sequential_call` / `timeouts.tools.concurrent_batch` (Hermes `config.yaml`) | Hermes's per-call / per-batch tool deadline. It also counts the time a call waits for review. Set both to `660` for a 10-minute window | `420` |
 | `HERMES_AGENT_TIMEOUT` | Raise if HITL reviews take more than 30 minutes (e.g. `7200`) | — |
 | `HERMES_SESSION_PLATFORM` | Platform adapter used by the notification bridge (e.g. `cli`) | — |
+
+## Approval window (Hermes time limits)
+
+A governed tool call waits for its reviewer inside Hermes's `pre_tool_call` hook. Three limits apply, and the **shortest one wins**:
+
+1. `AMP_HITL_TIMEOUT_MINUTES` (plugin, default 10 min)
+2. `plugins.hook_callback_timeout` (Hermes ≥ v2026.9, default **30 s**)
+3. `timeouts.tools.sequential_call` / `concurrent_batch` (Hermes, default **420 s**)
+
+The plugin stops waiting shortly before the shortest limit. The margin is 15 s, or a quarter of the limit when that is smaller. It then blocks the call with its own message, for example `AMP review for "write_file" did not complete within the 30s Hermes limit (plugins.hook_callback_timeout)`. Hermes then never has to kill the hook. Doing so would suppress the plugin for 60 s and leave the call without a clear reason. At startup the plugin logs an error when a Hermes limit is shorter than `AMP_HITL_TIMEOUT_MINUTES`.
+
+With default Hermes settings the window is only about 22 seconds. For a 10-minute window, put this in Hermes `config.yaml`:
+
+```yaml
+plugins:
+  hook_callback_timeout: 600        # max; 0 disables the cap (not recommended: a hung hook then blocks forever)
+timeouts:
+  tools:
+    sequential_call: 660
+    concurrent_batch: 660
+```
+
+Even then, `600 s` minus the margin is the ceiling, so reviewers have about **9.5 minutes**.
+
+**One governed call per batch.** Hermes authorizes the calls of a concurrent batch one at a time but they share one batch deadline, which the plugin cannot see; the window above is measured from when each call's own check starts. Prefer one governed call per batch.
+
+**One approval at a time.** Hermes authorizes the calls of a concurrent batch one after another, but they share one batch deadline. If the model issues two governed calls together, the second review only starts after the first is resolved, with whatever time is left. Ask the model to make one governed call at a time when reviews are slow.
+
+**Retries.** When a call gives up while its review is still open, the block message gives the workitem id and tells the model not to retry until a reviewer approves. If the model retries the **identical** call (same tool and arguments) in the same session, the plugin waits on the existing review instead of opening a new workitem. An approval given in the meantime then lets the retry through once.
+
+**Decisions are matched to the call.** AMP's decision poll is scoped to the AMP instance, not to the call. So the plugin binds each call to its own workitem id and ignores decisions for other workitems, for example an earlier approval on the same instance. An approval that carries no workitem id is not accepted unless `action_id` correlation proves it belongs to the call. With `AMP_ACTION_ID_CORRELATION=false` (the default), AMP can only report the newest workitem of the instance, so the plugin also:
+
+- runs **one review per session at a time**: a second governed call waits for the first to finish, and is blocked with "one approval at a time" if its own window ends first;
+- polls AMP **once before every governed request** (a "baseline"). Whatever workitem that poll reports existed before this call and is never accepted as its decision. This costs **one extra AMP call per governed action**, counted against the monthly call limit;
+- remembers the last 50 consumed or abandoned workitems per instance in `sessions.json`, so a restarted Hermes that reuses the AMP instance cannot act on an old approval.
+
+- only accepts a decision for a workitem it is bound to (from the request response or a *pending* poll). A decision AMP cannot tie to a workitem (`method` `auto`/`fallback`) blocks at once as an "unverifiable decision";
+- when a request's workitem never appeared before the call gave up, blocks the next call on that instance for up to 5 minutes ("has not been registered yet"), so the late workitem cannot decide a different call. This also applies after a failed request on the LLM and plan paths and with `AMP_ACTION_ID_CORRELATION=true`. The marker is kept in `sessions.json`, so a new Hermes process sees it too. One network error can therefore pause governed calls on that session for up to 5 minutes;
+- also locks across Hermes processes on the same session (a file lock under `plugin_state/amp-governance/locks/`). Where that lock cannot be taken (no `fcntl`, e.g. native Windows, or a filesystem without `flock`), governed tool calls are **blocked** unless `AMP_ACTION_ID_CORRELATION=true`. LLM and plan reviews are always unscoped, so they need the file lock (Linux, macOS or WSL) and stay blocked without it. If `sessions.json` cannot be read in time (locked by another process), the call is blocked too;
+- reuses a still-open review for an identical retry only while that review is still the newest workitem; otherwise it opens a new one;
+- only starts waiting on an explicit `pending`/`waiting-for-response` answer; any other answer that names a workitem blocks.
+
+If the baseline poll fails, a 4xx blocks the call. A network error follows `AMP_FAIL_CLOSED`; even with fail-open, the call is then decided only by a workitem the plugin saw pending. With `AMP_ACTION_ID_CORRELATION=true`, AMP matches by `action_id`, and the lock and baseline are skipped.
+
+**One-shot runs.** `hermes -z` / `hermes chat -q` do not fire Hermes's session-finalize hook, so the plugin finishes the AMP session at the end of the turn. This is bounded to 3 s and best-effort. Under `hermes chat -q` goal loops that run several turns, each turn therefore gets its own AMP instance. In one-shot mode Hermes captures stdout/stderr, so the `AMP: waiting for approval of …` line goes to the log, not the terminal.
 
 ## Notification Bridge
 
@@ -274,9 +329,11 @@ When AMP triggers HITL, the AHP plugin sends a notification back to the originat
 
 **Notification events:**
 - Action paused, awaiting human review
-- Review approved (or approved with modifications)
-- Review rejected
-- Review timed out and action blocked
+- Review approved
+- Review modified (the original call is blocked; re-submit with the reviewer's changes)
+- Review rejected (the reviewer's comment is passed on as `Reviewer note: …`, capped at 500 characters)
+- Review cancelled (blocked; not a reviewer rejection)
+- Review timed out, or the Hermes time limit was reached, and the action was blocked
 
 **Failure behavior:** Notification delivery is best-effort. If `send_message` fails for any reason (channel not found, gateway unavailable, network error), the failure is logged at WARNING level and silently swallowed. Governance enforcement never depends on delivery success.
 
@@ -504,11 +561,12 @@ These flat fields are promoted to policy `params` automatically, so an AMP Rule-
 | AMP response | Result `status` | `approved_budget_usd` |
 |---|---|---|
 | `no-hitl` / `allow` / `allowed` / `approved` | `approved` | set immediately |
-| `pending` + HITL approve/modify | `approved` | set after reviewer decision |
-| `pending` + HITL reject | `rejected` | not set |
-| `pending` + HITL timeout | `timed_out` | not set |
+| `pending` + HITL approve | `approved` | set after reviewer decision |
+| `pending` + HITL modify | `rejected` (reason: re-submit the modified plan) | not set |
+| `pending` + HITL reject, or review cancelled | `rejected` | not set |
+| `pending` + HITL timeout, or the Hermes tool deadline reached | `timed_out` | not set |
 | `no_policy` | `rejected` | not set |
-| AMP unreachable, or unexpected status | `error` | not set |
+| AMP unreachable, decision poll rejected (HTTP 401/403/404/429), or unexpected status | `error` | not set |
 
 The full result shape:
 
@@ -570,7 +628,23 @@ Check that `~/.hermes/.env` contains all required values:
 
 ### Tool calls are blocked unexpectedly
 
-Check:
+The block message says why:
+
+| Message starts with | Meaning |
+|---|---|
+| `… was rejected by AMP HITL review` | A reviewer rejected it (`Reviewer note:` carries their comment) |
+| `… the AMP review was deferred, not approved` | AMP returned `defer` (or another non-approval); not a reviewer rejection |
+| `AMP review lock unavailable …` | No cross-process lock on this platform/filesystem; enable `AMP_ACTION_ID_CORRELATION` |
+| `AMP reviewer approved a modified version …` | The reviewer changed the call; the plugin cannot apply the change yet, so re-submit it |
+| `The AMP review of … was cancelled` | The workitem was cancelled before anyone decided |
+| `… timed out waiting for AMP HITL approval` / `… did not complete within the …s Hermes limit` | Nobody decided in time (see [Approval window](#approval-window-hermes-time-limits)) |
+| `AMP rejected the governance request … (HTTP 4xx)` / `AMP rejected the HITL decision poll … (HTTP 4xx)` | AMP answered but refused: bad key, wrong org, monthly call limit (429), invalid payload |
+| `AMP governance is unavailable` | Network error or AMP 5xx (blocked because `AMP_FAIL_CLOSED=true`) |
+| `AMP was unreachable while waiting for the review …` | The decision polls failed with network errors / 5xx until the window ended (not a timeout) |
+| `… (unverifiable decision)` / `… has not been registered yet` | Decision-matching safeguards; see [Approval window](#approval-window-hermes-time-limits) |
+| `No active AMP governance policy …` / an AMP policy message | The agent has no active eval policy, or its HITL routing is invalid |
+
+Also check:
 
 - the active AMP policy for your Hermes agent
 - whether the Hermes tool was normalized into a different AMP tool/action than you expected
@@ -584,6 +658,8 @@ Check:
 - `AMP_HITL_TIMEOUT_MINUTES`
 - AMP workitems page for pending approvals
 - `HERMES_AGENT_TIMEOUT` — if HITL reviews take more than 30 minutes, set this to a higher value (e.g., `HERMES_AGENT_TIMEOUT=7200`)
+- On Hermes ≥ v2026.9, `plugins.hook_callback_timeout` (default 30 s) and `timeouts.tools.*` (default 420 s) cap the wait. The plugin blocks with "did not complete within the …s Hermes limit"; see [Approval window](#approval-window-hermes-time-limits)
+- Polls that AMP rejects (401/403/404/429, e.g. the monthly call limit) now block immediately with the HTTP status instead of waiting for the timeout
 
 ### Research skill stops triggering, or abandons governance mid-run
 
@@ -645,7 +721,9 @@ For local dev, use the `feature/llm-execution-blocking` branch of the Hermes rep
 - `plugins/saas/execution_context.py` — per-session LLM usage accumulation
 - `plugins/saas/notification.py` — platform-neutral notification bridge
 - `plugins/saas/policy.py` — Hermes tool normalization into AMP policy vocabulary
-- `plugins/saas/session_store.py` — session-to-AMP instance tracking
+- `plugins/saas/session_store.py` — session-to-AMP instance tracking (stores a SHA-256 digest of the API key, never the key)
+- `plugins/saas/hitl_poll.py` — HITL decision polling shared by the tool, LLM and plan paths (workitem binding, outcome mapping)
+- `plugins/saas/host_limits.py` — Hermes hook/tool time limits that bound the approval window
 - `plugins/saas/research_config.py` — research_topics.yaml loading/validation
 - `plugins/saas/skills/research-agent/SKILL.md` — plugin-bundled research workflow
 - `plugins/saas/skills-pointer/amp-research/SKILL.md`, `plugins/saas/skills-pointer/amp-research-topic/SKILL.md` — small discoverable pointer skills (configured mode, ad hoc mode); install via `hermes skills install <URL>` (see [Advanced Example: Govern LLM Budget Usage](#advanced-example-govern-llm-budget-usage))
@@ -666,4 +744,11 @@ mkdir -p ~/.hermes/plugins
 ln -s /path/to/amp-hermes-plugin/plugins/saas ~/.hermes/plugins/amp-governance
 hermes plugins enable amp-governance
 hermes gateway restart
+```
+
+Run the SaaS plugin's tests against a Hermes checkout (released Hermes is fine; the LLM-enforcement tests use a stand-in for `LLMExecutionBlocked` when Hermes lacks it):
+
+```bash
+cd plugins/saas
+PYTHONPATH=/path/to/hermes-agent /path/to/hermes-agent/venv/bin/python -m pytest -q -p no:cacheprovider
 ```

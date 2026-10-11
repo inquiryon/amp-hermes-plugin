@@ -30,8 +30,34 @@ if str(ROOT_PARENT) not in sys.path:
 if HERMES_AGENT_ROOT.exists() and str(HERMES_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(HERMES_AGENT_ROOT))
 
+import hermes as _plugin_mod
 from hermes import AmpGovernancePlugin, _estimate_pending_call_cost, _worst_cost_status
 from hermes.execution_context import ExecutionContext, ExecutionContextStore
+
+
+# Released Hermes (v2026.8/v2026.9) does not ship hermes_cli.middleware.LLMExecutionBlocked
+# (upstream PR nousresearch/hermes-agent#64662 is unmerged). Use the real class when present,
+# otherwise a stand-in with the same constructor/attributes so the enforcement logic still runs.
+try:
+    from hermes_cli.middleware import LLMExecutionBlocked as _LEB
+    _REAL_LEB_AVAILABLE = True
+except ImportError:
+    _REAL_LEB_AVAILABLE = False
+
+    class _LEB(Exception):  # type: ignore[no-redef]
+        def __init__(self, reason, metadata=None):
+            super().__init__(reason)
+            self.reason = reason
+            self.metadata = metadata or {}
+
+
+def _use_llm_blocked(test: unittest.TestCase):
+    """Patch the plugin module so enforcement raises _LEB for the duration of `test`."""
+    for name, value in (("_LLMExecutionBlocked", _LEB), ("_LLM_BLOCKED_AVAILABLE", True)):
+        patcher = patch.object(_plugin_mod, name, value)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+    return _LEB
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +115,9 @@ def _hitl_response(workitem_id="w-1"):
 
 
 def _decision(resolution="approved", info=""):
-    return {"status": "complete", "resolution": resolution, "information": info}
+    # AMP always echoes the workitem_id; the plugin only accepts a decision for the
+    # workitem its request is bound to (stale-decision guard).
+    return {"status": "complete", "resolution": resolution, "information": info, "workitem_id": "w-1"}
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +125,7 @@ def _decision(resolution="approved", info=""):
 # ---------------------------------------------------------------------------
 
 class CapabilityDetectionTests(unittest.TestCase):
+    @unittest.skipUnless(_REAL_LEB_AVAILABLE, "needs hermes-agent#64662 (LLMExecutionBlocked)")
     def test_blocked_available_import_succeeds(self):
         """When Hermes has LLMExecutionBlocked, the flag is True."""
         import importlib
@@ -132,6 +161,7 @@ class CapabilityDetectionTests(unittest.TestCase):
             register_middleware=Mock(),
             register_tool=Mock(),
             register_skill=Mock(),
+            register_cli_command=Mock(),
         )
 
         with patch.object(mod, "_LLM_BLOCKED_AVAILABLE", False), \
@@ -246,8 +276,7 @@ class ConfigurationGatingTests(unittest.TestCase):
 
 class PolicyOutcomeTests(unittest.TestCase):
     def setUp(self):
-        from hermes_cli.middleware import LLMExecutionBlocked
-        self.LEB = LLMExecutionBlocked
+        self.LEB = _use_llm_blocked(self)
 
     def _run_middleware(self, plugin, amp_response, decision_response=None):
         """Helper: run llm_execution_middleware with mocked AMP responses."""
@@ -338,11 +367,14 @@ class PolicyOutcomeTests(unittest.TestCase):
         next_call.assert_not_called()
 
     def test_amp_unavailable_fail_open_allows_provider(self):
+        # Transport outage proven before sending (connection refused): fail-open applies.
+        from hermes.amp_client import AmpClientError
+
         plugin = _make_plugin(fail_closed=False)
         exec_ctx = _make_exec_ctx()
         plugin._exec_contexts._store["sess-1"] = exec_ctx
         plugin._client = Mock()
-        plugin._client.request_llm_hitl = Mock(side_effect=Exception("connection refused"))
+        plugin._client.request_llm_hitl = Mock(side_effect=AmpClientError("connection refused", pre_send=True))
         plugin._notify_user = Mock()
         next_call = _make_next_call("resp")
 
@@ -355,6 +387,40 @@ class PolicyOutcomeTests(unittest.TestCase):
 
         self.assertEqual(result, "resp")
         next_call.assert_called_once()
+
+    def test_local_error_blocks_even_when_fail_open(self):
+        # A local error (bug, serialization) is not an outage: never fail-open.
+        plugin = _make_plugin(fail_closed=False)
+        exec_ctx = _make_exec_ctx()
+        plugin._exec_contexts._store["sess-1"] = exec_ctx
+        plugin._client = Mock()
+        plugin._client.request_llm_hitl = Mock(side_effect=TypeError("Object of type X is not JSON serializable"))
+        plugin._notify_user = Mock()
+        next_call = _make_next_call("resp")
+        with patch.object(plugin, "_safe_log"), self.assertRaises(self.LEB):
+            plugin.llm_execution_middleware(
+                request={"messages": []}, next_call=next_call,
+                session_id="sess-1", model="m", provider="p", base_url="", api_call_count=1,
+            )
+        next_call.assert_not_called()
+
+    def test_uncertain_transport_error_blocks_even_when_fail_open(self):
+        # A read timeout after sending: AMP may have accepted the request.
+        from hermes.amp_client import AmpClientError
+
+        plugin = _make_plugin(fail_closed=False)
+        exec_ctx = _make_exec_ctx()
+        plugin._exec_contexts._store["sess-1"] = exec_ctx
+        plugin._client = Mock()
+        plugin._client.request_llm_hitl = Mock(side_effect=AmpClientError("read timed out"))
+        plugin._notify_user = Mock()
+        next_call = _make_next_call("resp")
+        with patch.object(plugin, "_safe_log"), self.assertRaises(self.LEB):
+            plugin.llm_execution_middleware(
+                request={"messages": []}, next_call=next_call,
+                session_id="sess-1", model="m", provider="p", base_url="", api_call_count=1,
+            )
+        next_call.assert_not_called()
 
     def test_amp_unavailable_fail_closed_raises_leb(self):
         plugin = _make_plugin(fail_closed=True)
@@ -375,7 +441,8 @@ class PolicyOutcomeTests(unittest.TestCase):
 
         next_call.assert_not_called()
 
-    def test_unexpected_amp_status_fail_open_allows(self):
+    def test_unexpected_amp_status_blocks_even_when_fail_open(self):
+        # An unknown status (e.g. a reserved "deny") is an AMP answer, not an outage.
         plugin = _make_plugin(fail_closed=False)
         exec_ctx = _make_exec_ctx()
         plugin._exec_contexts._store["sess-1"] = exec_ctx
@@ -384,15 +451,14 @@ class PolicyOutcomeTests(unittest.TestCase):
         plugin._notify_user = Mock()
         next_call = _make_next_call("resp")
 
-        with patch.object(plugin, "_safe_log"):
-            result = plugin.llm_execution_middleware(
+        with patch.object(plugin, "_safe_log"), self.assertRaises(self.LEB):
+            plugin.llm_execution_middleware(
                 request={"messages": []}, next_call=next_call,
                 session_id="sess-1", model="m", provider="p", base_url="",
                 api_call_count=1,
             )
 
-        self.assertEqual(result, "resp")
-        next_call.assert_called_once()
+        next_call.assert_not_called()
 
     def test_unexpected_amp_status_fail_closed_blocks(self):
         plugin = _make_plugin(fail_closed=True)
@@ -418,10 +484,95 @@ class PolicyOutcomeTests(unittest.TestCase):
 # 4. Provider-call behavior
 # ---------------------------------------------------------------------------
 
+class LlmFailClosedTests(unittest.TestCase):
+    """A1 (LLM half), A2, A4, K1 and H2 on the LLM middleware path."""
+
+    def setUp(self):
+        self.LEB = _use_llm_blocked(self)
+
+    def _run(self, plugin, amp_response=None, decisions=None, request_error=None):
+        exec_ctx = _make_exec_ctx()
+        plugin._exec_contexts._store["sess-1"] = exec_ctx
+        plugin._client = Mock()
+        if request_error is not None:
+            plugin._client.request_llm_hitl = Mock(side_effect=request_error)
+        else:
+            plugin._client.request_llm_hitl = Mock(return_value=amp_response)
+        if decisions is not None:
+            # K2.1: one baseline get-decision precedes the request.
+            plugin._client.get_hitl_decision = Mock(side_effect=[{"status": "pending"}, *decisions])
+        plugin._notify_user = Mock()
+        with patch.object(plugin, "_safe_log"), patch("time.sleep", return_value=None):
+            return plugin._evaluate_llm_governance(
+                exec_ctx, "m", "p", "", "sess-1", {"messages": []}, 1
+            )
+
+    def test_policy_error_blocks_llm_call_even_when_fail_open(self):
+        plugin = _make_plugin(fail_closed=False)
+        decision = self._run(plugin, {"status": "policy_error", "message": "bad route"})
+        self.assertEqual(decision, ("block", "bad route"))
+
+    def test_config_error_without_message_blocks(self):
+        plugin = _make_plugin(fail_closed=False)
+        decision, reason = self._run(plugin, {"status": "config_error"})
+        self.assertEqual(decision, "block")
+        self.assertTrue(reason)
+
+    def test_hitl_modify_blocks_llm_call(self):
+        plugin = _make_plugin()
+        decision, reason = self._run(plugin, _hitl_response(), [_decision("modify")])
+        self.assertEqual(decision, "block")
+        self.assertIn("reviewer requested modifications", reason)
+
+    def test_cancelled_decision_blocks_llm_call(self):
+        plugin = _make_plugin()
+        decision, reason = self._run(
+            plugin, _hitl_response(),
+            [{"status": "complete", "resolution": "reject", "method": "cancelled", "workitem_id": "w-1"}],
+        )
+        self.assertEqual(decision, "block")
+        self.assertIn("cancelled", reason)
+
+    def test_poll_403_blocks_llm_call_in_one_poll(self):
+        from hermes.amp_client import AmpClientError
+
+        plugin = _make_plugin()
+        decision, reason = self._run(
+            plugin, _hitl_response(), [AmpClientError("HTTP 403", status_code=403, body="forbidden")]
+        )
+        self.assertEqual(decision, "block")
+        self.assertIn("HTTP 403", reason)
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 2)  # baseline + 1 poll
+
+    def test_request_4xx_blocks_llm_call_even_when_fail_open(self):
+        from hermes.amp_client import AmpClientError
+
+        plugin = _make_plugin(fail_closed=False)
+        decision, reason = self._run(
+            plugin, request_error=AmpClientError("HTTP 429", status_code=429, body="call_limit_reached")
+        )
+        self.assertEqual(decision, "block")
+        self.assertIn("HTTP 429", reason)
+
+    def test_stale_decision_for_other_workitem_is_ignored(self):
+        plugin = _make_plugin()
+        decision, _ = self._run(
+            plugin, _hitl_response("w-2"),
+            [{"status": "complete", "resolution": "approve", "workitem_id": "w-OLD"},
+             {"status": "complete", "resolution": "reject", "workitem_id": "w-2"}],
+        )
+        self.assertEqual(decision, "block")
+        self.assertEqual(plugin._client.get_hitl_decision.call_count, 3)  # baseline + 2 polls
+
+    def test_reviewer_note_is_labelled_on_reject(self):
+        plugin = _make_plugin()
+        _, reason = self._run(plugin, _hitl_response(), [_decision("reject", "too costly")])
+        self.assertIn("Reviewer note: too costly", reason)
+
+
 class ProviderCallBehaviorTests(unittest.TestCase):
     def setUp(self):
-        from hermes_cli.middleware import LLMExecutionBlocked
-        self.LEB = LLMExecutionBlocked
+        self.LEB = _use_llm_blocked(self)
 
     def test_allow_calls_provider_exactly_once(self):
         plugin = _make_plugin()
@@ -555,8 +706,7 @@ class ProviderCallBehaviorTests(unittest.TestCase):
 
 class MultiTurnContextTests(unittest.TestCase):
     def setUp(self):
-        from hermes_cli.middleware import LLMExecutionBlocked
-        self.LEB = LLMExecutionBlocked
+        self.LEB = _use_llm_blocked(self)
 
     def test_three_allowed_calls_accumulate_correctly(self):
         plugin = _make_plugin(llm_enabled=True, mode="observe")
@@ -736,8 +886,7 @@ class MultiTurnContextTests(unittest.TestCase):
 
 class HitlNotificationTests(unittest.TestCase):
     def setUp(self):
-        from hermes_cli.middleware import LLMExecutionBlocked
-        self.LEB = LLMExecutionBlocked
+        self.LEB = _use_llm_blocked(self)
 
     def _run_hitl(self, plugin, decision_resolution):
         exec_ctx = _make_exec_ctx(total_cost_usd=1.0, cost_status="estimated")
@@ -1006,7 +1155,7 @@ class ExecutionContextEnforcementFieldsTests(unittest.TestCase):
         plugin._client.request_llm_hitl = Mock(return_value=_block_response())
         plugin._notify_user = Mock()
 
-        from hermes_cli.middleware import LLMExecutionBlocked
+        LLMExecutionBlocked = _use_llm_blocked(self)
         with patch.object(plugin, "_safe_log"):
             with self.assertRaises(LLMExecutionBlocked):
                 plugin.llm_execution_middleware(

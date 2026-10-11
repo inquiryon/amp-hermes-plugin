@@ -26,6 +26,9 @@ Hermes tools are normalized into AMP policy vocabulary like this:
 - `write_file` → `write/write`
 - `patch` → `write/edit`
 - `web_search` → `exec/web_search`
+- `web_extract` → `exec/web_extract`
+
+Other tools are not governed unless `AMP_GOVERN_UNLISTED_TOOLS=true` (SaaS plugin, off by default). With that set, every other tool except the plugin's own three tools (`amp_evaluate_research_plan`, `amp_load_research_topics`, `amp_governance_summary`) is sent as `<tool name>/invoke` with its arguments (secret-looking keys and values redacted, capped at 2,000 chars). Each extra tool call costs one AMP request against the monthly call limit.
 
 ## Prerequisites
 
