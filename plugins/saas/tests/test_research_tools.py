@@ -48,6 +48,7 @@ class ToolRegistrationTests(unittest.TestCase):
             register_middleware=Mock(),
             register_tool=Mock(),
             register_skill=Mock(),
+            register_cli_command=Mock(),
         )
         fresh_plugin = mod.AmpGovernancePlugin()
         with patch.object(mod, "_PLUGIN", fresh_plugin):
@@ -75,6 +76,7 @@ class ToolRegistrationTests(unittest.TestCase):
             register_middleware=Mock(),
             register_tool=Mock(),
             register_skill=Mock(side_effect=FileNotFoundError("no SKILL.md")),
+            register_cli_command=Mock(),
         )
         fresh_plugin = mod.AmpGovernancePlugin()
         with patch.object(mod, "_PLUGIN", fresh_plugin):

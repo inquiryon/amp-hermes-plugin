@@ -1,17 +1,132 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
-from typing import Any, Dict, Optional
+import socket
+import threading
+import time
+from typing import Any, Dict, Iterator, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import AmpConfig
 from .policy import NormalizedAction
 
 
+_DEFAULT_HTTP_TIMEOUT_SECONDS = 30.0
+# Server-controlled text kept from an error response (it reaches logs and model context).
+_ERROR_BODY_LIMIT = 500
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Refuse redirects: urllib would forward the X-API-Key header to the new host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
+_OPENER = build_opener(_NoRedirect())
+
+
+def urlopen(req: Request, timeout: float) -> Any:
+    """urllib.request.urlopen without redirect following (a 3xx surfaces as HTTPError)."""
+    return _OPENER.open(req, timeout=timeout)
+_MIN_HTTP_TIMEOUT_SECONDS = 1.0
+
+# Per-thread wall-clock deadline for AMP HTTP calls made inside one Hermes hook
+# or tool invocation (see request_deadline). Thread-local because Hermes runs
+# hooks for concurrent tool calls on separate worker threads.
+_deadline_state = threading.local()
+
+
 class AmpClientError(RuntimeError):
-    pass
+    """An AMP call failed. ``status_code`` is the HTTP status when AMP answered
+    (None for network errors, timeouts and exhausted deadlines); ``body`` is
+    the raw response body AMP sent with that status, if any. ``pre_send`` is True
+    only when the request provably never reached AMP (connection refused, DNS
+    failure): the only case fail-open may allow."""
+
+    def __init__(
+        self, message: str, *, status_code: Optional[int] = None, body: str = "", pre_send: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+        self.pre_send = pre_send
+
+
+# Connection errors that happen before any request byte is sent.
+_PRE_SEND_ERRORS = (ConnectionRefusedError, socket.gaierror)
+
+# Best-effort calls (logs, state, notifications) inside a governance window get at
+# most this long each, and none once the window has ended.
+_BEST_EFFORT_CAP_SECONDS = 2.0
+
+
+@contextmanager
+def request_deadline(at: Optional[float], *, hard: bool = False, grace: float = 1.0) -> Iterator[None]:
+    """Bound every AMP HTTP call made on this thread by the absolute time ``at``.
+
+    Each request's socket timeout becomes ``min(30 s, at - now)``. With
+    ``hard=False`` (governance checks) a request is never refused: once the
+    deadline has passed the timeout floors at 1 s, so the first governance
+    request is always attempted and the caller decides what an exhausted budget
+    means. With ``hard=True`` (best-effort cleanup at exit) a request made after
+    the deadline raises ``AmpClientError`` immediately instead.
+    ``at=None`` leaves the default 30 s timeout in place. ``grace`` is how far past
+    ``at`` a session-store lock wait may run (see current_grace).
+    """
+    previous = getattr(_deadline_state, "value", None)
+    _deadline_state.value = (at, hard, grace) if at is not None else None
+    try:
+        yield
+    finally:
+        _deadline_state.value = previous
+
+
+def current_deadline() -> Optional[float]:
+    """The calling thread's governance deadline, if any (used to bound store-lock waits)."""
+    state = getattr(_deadline_state, "value", None)
+    return None if state is None else state[0]
+
+
+def current_grace() -> float:
+    """How far past current_deadline() a store-lock wait may run (default 1 s)."""
+    state = getattr(_deadline_state, "value", None)
+    return 1.0 if state is None else state[2]
+
+
+def window_open() -> bool:
+    """False once the calling thread's governance deadline has passed."""
+    state = getattr(_deadline_state, "value", None)
+    return state is None or time.time() < state[0]
+
+
+@contextmanager
+def best_effort() -> Iterator[None]:
+    """Bound a best-effort AMP call: <= 2 s, and refused outright (AmpClientError)
+    once the current governance deadline has passed, so logging can never push a
+    hook past Hermes's limit."""
+    state = getattr(_deadline_state, "value", None)
+    cap = time.time() + _BEST_EFFORT_CAP_SECONDS
+    at = cap if state is None else min(state[0], cap)
+    with request_deadline(at, hard=True):
+        yield
+
+
+def _http_timeout() -> float:
+    state = getattr(_deadline_state, "value", None)
+    if state is None:
+        return _DEFAULT_HTTP_TIMEOUT_SECONDS
+    at, hard = state[0], state[1]
+    remaining = at - time.time()
+    if remaining <= 0 and hard:
+        # Not an outage: never usable as a fail-open reason.
+        raise AmpClientError("AMP request deadline exhausted")
+    if hard:
+        return min(_DEFAULT_HTTP_TIMEOUT_SECONDS, remaining)  # no floor: never past the deadline
+    return min(_DEFAULT_HTTP_TIMEOUT_SECONDS, max(remaining, _MIN_HTTP_TIMEOUT_SECONDS))
 
 
 class AmpClient:
@@ -38,15 +153,35 @@ class AmpClient:
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
         req = Request(url, data=data, headers=self._headers(), method=method)
+        timeout = _http_timeout()
         try:
-            with urlopen(req, timeout=30) as resp:
-                body = resp.read().decode("utf-8") or "{}"
+            with urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace") or "{}"
+                status = getattr(resp, "status", None)
+            try:
                 return json.loads(body)
+            except ValueError as exc:
+                # AMP (or a proxy/captive portal in front of it) answered with something
+                # that is not JSON. Carry the status so callers treat it as an answer.
+                raise AmpClientError(
+                    f"AMP returned a non-JSON response (HTTP {status})",
+                    status_code=status if isinstance(status, int) else 200,
+                    body=body[:500],
+                ) from exc
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="ignore")
-            raise AmpClientError(f"HTTP {exc.code}: {body or exc.reason}") from exc
+            body = exc.read().decode("utf-8", errors="ignore")[:_ERROR_BODY_LIMIT]
+            raise AmpClientError(
+                f"HTTP {exc.code}: {body or exc.reason}", status_code=exc.code, body=body
+            ) from exc
         except URLError as exc:
-            raise AmpClientError(str(exc.reason)) from exc
+            # urllib wraps connect *and* send errors in URLError: only refused/DNS
+            # prove the request never reached AMP.
+            raise AmpClientError(str(exc.reason), pre_send=isinstance(exc.reason, _PRE_SEND_ERRORS)) from exc
+        except (TimeoutError, OSError) as exc:
+            # A read timeout or reset after the connection was established is
+            # not wrapped in URLError; surface it as an AMP failure so callers
+            # treat it like any other outage instead of an unexpected crash.
+            raise AmpClientError(f"AMP request failed: {exc}") from exc
 
     def init_instance(self, session_id: str, model: str, platform: str) -> str:
         data = self._request(
@@ -95,43 +230,50 @@ class AmpClient:
             },
         )
 
-    def request_hitl(self, instance_id: str, action: NormalizedAction) -> Dict[str, Any]:
+    def request_hitl(
+        self,
+        instance_id: str,
+        action: NormalizedAction,
+        *,
+        action_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Submit a governed tool action for eval-policy/HITL review.
 
         The payload uses the normalized Hermes tool/action names plus the
         tool-specific context extracted by the policy normalizer. AMP then
         decides allow/no-hitl, pending HITL, or a policy/config error.
+        ``action_id`` (opt-in, AMP_ACTION_ID_CORRELATION) is sent top-level so
+        AMP can scope the later decision poll to this one call.
         """
-        return self._request(
-            "POST",
-            "/api/hitl/request",
-            {
-                "caller_id": instance_id,
-                "instance_id": instance_id,
-                "org_id": self._config.org_id,
-                "agent_name": self._config.agent_name,
-                "tool": action.tool,
-                "action": action.action,
-                "context": action.context,
-                "hitl": {
-                    "enable": True,
-                    "when": "policy",
-                },
+        payload: Dict[str, Any] = {
+            "caller_id": instance_id,
+            "instance_id": instance_id,
+            "org_id": self._config.org_id,
+            "agent_name": self._config.agent_name,
+            "tool": action.tool,
+            "action": action.action,
+            "context": action.context,
+            "hitl": {
+                "enable": True,
+                "when": "policy",
             },
-        )
+        }
+        if action_id:
+            payload["action_id"] = action_id
+        return self._request("POST", "/api/hitl/request", payload)
 
-    def get_hitl_decision(self, instance_id: str) -> Dict[str, Any]:
+    def get_hitl_decision(self, instance_id: str, *, action_id: Optional[str] = None) -> Dict[str, Any]:
         """Poll the normalized decision endpoint for a caller instance.
 
         Returns a compact decision state (`pending` or `complete`) without
         exposing the internal workitem-stage routing details AMP uses behind
-        the scenes.
+        the scenes. With ``action_id`` AMP only matches that call's workitem
+        and echoes ``action_id`` back.
         """
-        return self._request(
-            "GET",
-            "/api/hitl/get-decision",
-            query={"caller_id": instance_id},
-        )
+        query = {"caller_id": instance_id}
+        if action_id:
+            query["action_id"] = action_id
+        return self._request("GET", "/api/hitl/get-decision", query=query)
 
     def request_llm_hitl(
         self,
