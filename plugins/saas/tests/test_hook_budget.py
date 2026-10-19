@@ -145,6 +145,20 @@ class HookBudgetTests(unittest.TestCase):
         error.assert_not_called()
 
 
+def _host_has_hook_timeout_resolver() -> bool:
+    try:
+        from hermes_cli.plugins import _resolve_hook_callback_timeout  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+_needs_hook_timeout_resolver = unittest.skipUnless(
+    _host_has_hook_timeout_resolver(),
+    "installed Hermes predates plugins.hook_callback_timeout (v2026.9)",
+)
+
+
 class HostLimitResolutionTests(unittest.TestCase):
     def test_margin_is_quarter_of_small_limits_and_capped_at_15s(self):
         self.assertEqual(host_limits.compute_budget(0, 600, hook_timeout=10, tool_deadline=None).deadline, 7.5)
@@ -152,12 +166,14 @@ class HostLimitResolutionTests(unittest.TestCase):
         budget = host_limits.compute_budget(0, 300, hook_timeout=600, tool_deadline=None)
         self.assertFalse(budget.host_limited)
 
+    @_needs_hook_timeout_resolver
     def test_zero_or_failing_resolvers_mean_unbounded(self):
         with patch("hermes_cli.plugins._resolve_hook_callback_timeout", return_value=0):
             self.assertIsNone(host_limits.hook_timeout_seconds())
         with patch("hermes_cli.plugins._resolve_hook_callback_timeout", side_effect=RuntimeError):
             self.assertIsNone(host_limits.hook_timeout_seconds())
 
+    @_needs_hook_timeout_resolver
     def test_real_hermes_resolvers_are_found(self):
         # Pins the private Hermes APIs this relies on (R8): defaults are 30 s hook / 420 s tool.
         with patch("hermes_cli.plugins._resolve_hook_callback_timeout", return_value=30.0):

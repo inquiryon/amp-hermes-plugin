@@ -1215,6 +1215,7 @@ class RegressionToolGovernanceTests(unittest.TestCase):
 
     def test_tool_fail_closed_is_separate_from_llm_fail_closed(self):
         """AMP_FAIL_CLOSED (tool) and AMP_LLM_GOVERNANCE_FAIL_CLOSED (LLM) are independent."""
+        from hermes.amp_client import AmpClientError
         plugin = _make_plugin(fail_closed=False)  # LLM fail-open
         plugin._config = SimpleNamespace(
             **{**vars(plugin._config),
@@ -1225,7 +1226,9 @@ class RegressionToolGovernanceTests(unittest.TestCase):
         exec_ctx = _make_exec_ctx()
         plugin._exec_contexts._store["s"] = exec_ctx
         plugin._client = Mock()
-        plugin._client.request_llm_hitl = Mock(side_effect=Exception("down"))
+        plugin._client.request_llm_hitl = Mock(
+            side_effect=AmpClientError("connection refused", pre_send=True)
+        )  # proven outage: the only failure fail-open may allow
         plugin._notify_user = Mock()
         next_call = _make_next_call("resp")
 
