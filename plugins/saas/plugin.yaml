@@ -1,10 +1,11 @@
 name: amp-governance
-version: "0.5.2"
+version: "0.5.3"
 description: "AMP governance plugin for Hermes. Normalizes selected Hermes tools into AMP eval-policy actions, logs activity, enforces allow/block/HITL decisions before execution, observes LLM token and cost usage per session, saves per-call LLM trace data (prompt/answer/reasoning) so AMP's log viewer can show what each call was doing, enforces pre-LLM resource governance when enabled, sends governance notifications back to the originating channel, and provides a proposed-plan approval interface plus a sample governed research-agent skill and tools."
 author: "Inquiryon"
 hooks:
   - on_session_start
   - on_session_finalize
+  - on_session_end
   - pre_llm_call
   - pre_tool_call
   - post_tool_call

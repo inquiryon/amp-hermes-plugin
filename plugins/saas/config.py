@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Dict
@@ -77,7 +77,7 @@ def _bool_value(env_file: Dict[str, str], default: bool, *names: str) -> bool:
 @dataclass(frozen=True)
 class AmpConfig:
     backend_url: str
-    api_key: str
+    api_key: str = field(repr=False)  # never in reprs/logs
     org_id: str
     agent_name: str
     username: str
@@ -91,6 +91,12 @@ class AmpConfig:
     llm_governance_mode: str        # "observe" | "enforce"
     llm_governance_fail_closed: bool
     llm_governance_include_subagents: bool
+    # Fields below are optional (defaults) so existing AmpConfig(...) callers keep working.
+    # Opt-in action_id correlation of HITL request + decision poll (A6); needs AMP's HITL
+    # service to persist the top-level action_id on the workitem.
+    action_id_correlation: bool = False
+    # Block when an action_id-scoped review still has no workitem after this many seconds.
+    action_id_watchdog_seconds: int = 60
 
     @property
     def is_configured(self) -> bool:
@@ -137,4 +143,6 @@ def load_config() -> AmpConfig:
         llm_governance_mode=llm_governance_mode,
         llm_governance_fail_closed=_bool_value(env_file, False, "AMP_LLM_GOVERNANCE_FAIL_CLOSED"),
         llm_governance_include_subagents=_bool_value(env_file, True, "AMP_LLM_GOVERNANCE_INCLUDE_SUBAGENTS"),
+        action_id_correlation=_bool_value(env_file, False, "AMP_ACTION_ID_CORRELATION"),
+        action_id_watchdog_seconds=_int_value(env_file, 60, "AMP_ACTION_ID_WATCHDOG_SECONDS"),
     )
