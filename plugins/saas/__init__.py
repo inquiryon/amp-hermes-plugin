@@ -25,7 +25,7 @@ from .execution_context import ExecutionContext, ExecutionContextStore, LlmCallR
 from .hitl_poll import DecisionLedger, PollOutcome, poll_for_decision, reviewer_note
 from .host_limits import WaitBudget, compute_budget, hook_timeout_seconds, limits_shorter_than, tool_deadline_seconds
 from .notification import notify_user
-from .policy import NormalizedAction, normalize_tool_call
+from .policy import NormalizedAction, normalize_tool_call, redact_secrets
 from .research_config import load_research_topics
 from .session_store import SessionRecord, SessionStore, agent_fingerprint
 
@@ -1314,7 +1314,8 @@ class AmpGovernancePlugin:
             )
         self._safe_log(
             instance_id,
-            f"Policy check | raw_tool={action.raw_tool_name} | tool={action.tool} | action={action.action} | context={action.context}",
+            f"Policy check | raw_tool={action.raw_tool_name} | tool={action.tool} | action={action.action} | "
+            f"context={ {k: v for k, v in action.context.items() if k != 'content_preview'} }",
         )
         try:
             if action_id:
@@ -2022,7 +2023,12 @@ class AmpGovernancePlugin:
     ) -> Optional[Dict[str, str]]:
         started_at = time.time()
         try:
-            action = normalize_tool_call(tool_name, args)
+            action = normalize_tool_call(
+                tool_name,
+                args,
+                include_content_preview=getattr(self._config, "send_content_preview", False),
+                govern_unlisted=getattr(self._config, "govern_unlisted_tools", False),
+            )
         except Exception as exc:
             # Hermes treats a hook exception as "no decision" (allow): never let one escape.
             logger.warning("amp-governance could not inspect %s: %s", tool_name, exc)
@@ -2086,7 +2092,9 @@ class AmpGovernancePlugin:
         **_: Any,
     ) -> None:
         try:
-            action = normalize_tool_call(tool_name, args)
+            action = normalize_tool_call(
+                tool_name, args, govern_unlisted=getattr(self._config, "govern_unlisted_tools", False)
+            )
         except Exception as exc:  # an observer hook must never raise into Hermes
             logger.warning("amp-governance could not inspect %s result: %s", tool_name, exc)
             return
@@ -2105,10 +2113,11 @@ class AmpGovernancePlugin:
         summary = f"Tool result | raw_tool={tool_name} | normalized={action.tool}/{action.action} | status={status or 'unknown'}"
         if duration_ms is not None:
             summary += f" | duration_ms={duration_ms}"
+        # Tool output goes to AMP logs: redact credentials before it leaves the machine.
         if error_message:
-            summary += f" | error={_truncate(error_message, 180)}"
+            summary += f" | error={_truncate(redact_secrets(str(error_message)[:2000]), 180)}"
         elif result:
-            summary += f" | result={_truncate(str(result), 180)}"
+            summary += f" | result={_truncate(redact_secrets(str(result)[:2000]), 180)}"
         self._safe_log(
             record.instance_id,
             summary,
